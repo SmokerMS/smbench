@@ -126,3 +126,49 @@ pub fn serialize_request(request: &WorkerRequest) -> Result<String> {
     }
     Ok(json_str)
 }
+
+pub fn serialize_request_line(request: &WorkerRequest) -> Result<String> {
+    let json_str = serialize_request(request)?;
+    if json_str.len() + 1 > MAX_MESSAGE_BYTES {
+        return Err(anyhow!(
+            "Message too large with newline: {} bytes",
+            json_str.len() + 1
+        ));
+    }
+    Ok(format!("{json_str}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_request_line_newline() {
+        let request = WorkerRequest::Shutdown;
+        let line = serialize_request_line(&request).unwrap();
+        assert!(line.ends_with('\n'));
+        assert!(!line[..line.len() - 1].contains('\n'));
+    }
+
+    #[test]
+    fn test_serialize_request_line_size_limit() {
+        let base = WorkerRequest::WriteFromBlob {
+            request_id: "req".to_string(),
+            handle_id: "h".to_string(),
+            offset: 0,
+            blob_path: "x".to_string(),
+        };
+        let mut line = serialize_request_line(&base).unwrap();
+        let pad_len = MAX_MESSAGE_BYTES - line.len();
+        line.push_str(&"x".repeat(pad_len));
+        assert_eq!(line.len(), MAX_MESSAGE_BYTES);
+
+        let over = WorkerRequest::WriteFromBlob {
+            request_id: "req".to_string(),
+            handle_id: "h".to_string(),
+            offset: 0,
+            blob_path: "x".repeat(MAX_MESSAGE_BYTES),
+        };
+        assert!(serialize_request_line(&over).is_err());
+    }
+}
