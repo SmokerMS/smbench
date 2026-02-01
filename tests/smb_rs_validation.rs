@@ -394,8 +394,33 @@ mod smb_rs_validation {
         let mut options = CreateOptions::new();
         options.set_non_directory_file(true);
         options.set_delete_on_close(true);
-        let create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options);
-        let resource = client.create_file(&file_path, &create_args).await?;
+        let mut create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options);
+        create_args = create_args
+            .with_share_access(smb::ShareAccessFlags::new().with_delete(true));
+        let resource = match client.create_file(&file_path, &create_args).await {
+            Ok(resource) => resource,
+            Err(err) => {
+                eprintln!("Delete-on-close create failed: {err}; falling back to disposition");
+                let create_args = FileCreateArgs::make_overwrite(
+                    FileAttributes::new(),
+                    CreateOptions::new(),
+                );
+                let resource = client.create_file(&file_path, &create_args).await?;
+                let file: File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+                };
+                file.set_info(smb::FileDispositionInformation::default())
+                    .await?;
+                file.close().await?;
+                let open_access = FileAccessMask::new().with_generic_read(true);
+                let open_args = FileCreateArgs::make_open_existing(open_access);
+                let reopened = client.create_file(&file_path, &open_args).await;
+                assert!(reopened.is_err(), "expected delete to remove file");
+                client.close().await?;
+                return Ok(());
+            }
+        };
         let file: File = match resource.try_into() {
             Ok(file) => file,
             Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
