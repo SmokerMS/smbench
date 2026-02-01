@@ -463,6 +463,15 @@ impl Scheduler {
                             };
                             let conn_arc = Arc::new(Mutex::new(conn));
                             connections.insert(work.client_idx, conn_arc.clone());
+                            if let Some(mut rx) = conn_arc.lock().await.take_oplock_receiver() {
+                                let handler_conn = conn_arc.clone();
+                                tokio::spawn(async move {
+                                    while let Some(break_msg) = rx.recv().await {
+                                        let mut conn = handler_conn.lock().await;
+                                        conn.handle_oplock_break(break_msg).await;
+                                    }
+                                });
+                            }
                             conn_arc
                         }
                     };

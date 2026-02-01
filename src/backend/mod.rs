@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 
 use crate::ir::{OpenMode, Operation};
 
+#[cfg(feature = "smb-rs-backend")]
+pub mod smbrs;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendMode {
     Development,
@@ -52,6 +55,9 @@ pub trait SMBFileHandle: Send + Sync {
     async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>>;
     async fn write(&self, offset: u64, data: &[u8]) -> Result<u64>;
     async fn close(self: Box<Self>) -> Result<()>;
+    fn file_id(&self) -> Option<String> {
+        None
+    }
     fn granted_oplock(&self) -> Option<OplockLevel> {
         None
     }
@@ -84,6 +90,7 @@ enum OplockState {
 pub struct ConnectionState {
     inner: Box<dyn SMBConnectionInner>,
     handles: HashMap<String, HandleEntry>,
+    file_id_map: HashMap<String, String>,
     oplock_break_rx: Option<mpsc::Receiver<OplockBreak>>,
     oplock_wait_timeout: tokio::time::Duration,
 }
@@ -91,6 +98,7 @@ pub struct ConnectionState {
 #[derive(Debug, Clone)]
 pub struct OplockBreak {
     pub handle_ref: String,
+    pub file_id: Option<String>,
     pub new_level: OplockLevel,
 }
 
@@ -99,6 +107,7 @@ impl ConnectionState {
         Self {
             inner,
             handles: HashMap::new(),
+            file_id_map: HashMap::new(),
             oplock_break_rx: None,
             oplock_wait_timeout: tokio::time::Duration::from_secs(30),
         }
@@ -112,6 +121,10 @@ impl ConnectionState {
     pub fn with_oplock_channel(mut self, rx: mpsc::Receiver<OplockBreak>) -> Self {
         self.oplock_break_rx = Some(rx);
         self
+    }
+
+    pub fn take_oplock_receiver(&mut self) -> Option<mpsc::Receiver<OplockBreak>> {
+        self.oplock_break_rx.take()
     }
 
     pub async fn execute(&mut self, op: &Operation) -> Result<()> {
@@ -141,6 +154,11 @@ impl ConnectionState {
                         path: path.clone(),
                     },
                 );
+                if let Some(entry) = self.handles.get(handle_ref) {
+                    if let Some(file_id) = entry.handle.file_id() {
+                        self.file_id_map.insert(file_id, handle_ref.clone());
+                    }
+                }
                 Ok(())
             }
             Operation::Read {
@@ -174,6 +192,9 @@ impl ConnectionState {
             }
             Operation::Close { handle_ref, .. } => {
                 if let Some(entry) = self.handles.remove(handle_ref) {
+                    if let Some(file_id) = entry.handle.file_id() {
+                        self.file_id_map.remove(&file_id);
+                    }
                     entry.handle.close().await?;
                 }
                 Ok(())
@@ -201,12 +222,20 @@ impl ConnectionState {
         Ok(())
     }
 
-    pub async fn run_oplock_handler(mut self) {
-        let Some(mut rx) = self.oplock_break_rx.take() else {
+    pub async fn handle_oplock_break(&mut self, break_msg: OplockBreak) {
+        if break_msg.handle_ref.is_empty() && break_msg.file_id.is_none() {
             return;
+        }
+        let handle_ref = if self.handles.contains_key(&break_msg.handle_ref) {
+            Some(break_msg.handle_ref.clone())
+        } else if let Some(file_id) = &break_msg.file_id {
+            self.file_id_map.get(file_id).cloned()
+        } else {
+            None
         };
-        while let Some(break_msg) = rx.recv().await {
-            if let Some(entry) = self.handles.get_mut(&break_msg.handle_ref) {
+
+        if let Some(handle_ref) = handle_ref {
+            if let Some(entry) = self.handles.get_mut(&handle_ref) {
                 entry.oplock_state = OplockState::BreakPending { waiters: Vec::new() };
                 if let Err(err) = entry
                     .handle
@@ -214,7 +243,7 @@ impl ConnectionState {
                     .await
                 {
                     tracing::error!(error = %err, "Failed to ACK oplock break");
-                    continue;
+                    return;
                 }
                 if let OplockState::BreakPending { waiters } = &mut entry.oplock_state {
                     for tx in waiters.drain(..) {
@@ -222,12 +251,13 @@ impl ConnectionState {
                     }
                     entry.oplock_state = OplockState::Broken;
                 }
-            } else {
-                tracing::warn!(
-                    handle_ref = break_msg.handle_ref,
-                    "Received oplock break for unknown handle"
-                );
             }
+        } else {
+            tracing::warn!(
+                handle_ref = break_msg.handle_ref,
+                file_id = ?break_msg.file_id,
+                "Received oplock break for unknown handle"
+            );
         }
     }
 }
