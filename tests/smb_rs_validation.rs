@@ -246,4 +246,52 @@ mod smb_rs_validation {
         client1.close().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_rename_delete() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs rename/delete test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let file_name = unique_name("smbench_rename_src");
+        let file_path = share_path.with_path(&file_name);
+
+        let mut options = CreateOptions::new();
+        options.set_non_directory_file(true);
+        let create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options);
+        let resource = client.create_file(&file_path, &create_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+
+        let new_name = unique_name("smbench_rename_dst");
+        let rename_info = smb::FileRenameInformation::new(false, &new_name);
+        file.set_info(rename_info).await?;
+        file.close().await?;
+
+        let renamed_path = share_path.with_path(&new_name);
+        let open_access = FileAccessMask::new().with_generic_all(true);
+        let open_args = FileCreateArgs::make_open_existing(open_access);
+        let resource = client.create_file(&renamed_path, &open_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+
+        file.set_info(smb::FileDispositionInformation::default())
+            .await?;
+        file.close().await?;
+
+        let deleted = client.create_file(&renamed_path, &open_args).await;
+        assert!(deleted.is_err(), "expected delete to remove file");
+
+        client.close().await?;
+        Ok(())
+    }
 }
