@@ -598,6 +598,26 @@ mod tests {
     }
 
     #[test]
+    fn test_build_args_from_extensions() {
+        let ext = serde_json::json!({
+            "desired_access": {
+                "generic_read": true,
+                "file_write_data": true
+            },
+            "create_disposition": "overwrite_if",
+            "create_options": {"write_through": true, "non_directory_file": true},
+            "file_attributes": {"readonly": true}
+        });
+        let args = build_args_from_extensions(OpenMode::ReadWrite, &ext);
+        assert_eq!(args.disposition, smb::CreateDisposition::OverwriteIf);
+        assert!(args.options.write_through());
+        assert!(args.options.non_directory_file());
+        assert!(args.attributes.readonly());
+        assert!(args.desired_access.generic_read());
+        assert!(args.desired_access.file_write_data());
+    }
+
+    #[test]
     fn test_resolve_rename_target() {
         let share = smb::UncPath::from_str(r"\\server\\share").unwrap();
         let target = resolve_rename_target(&share, "dir\\file.txt").unwrap();
