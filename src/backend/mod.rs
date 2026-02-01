@@ -58,11 +58,21 @@ pub trait SMBFileHandle: Send + Sync {
     fn file_id(&self) -> Option<String> {
         None
     }
+    fn lease_key(&self) -> Option<String> {
+        None
+    }
     fn granted_oplock(&self) -> Option<OplockLevel> {
         None
     }
     async fn acknowledge_oplock_break(&self, _new_level: OplockLevel) -> Result<()> {
         Err(anyhow!("Oplocks not supported"))
+    }
+    async fn acknowledge_lease_break(
+        &self,
+        _lease_key: &str,
+        _lease_state: LeaseState,
+    ) -> Result<()> {
+        Err(anyhow!("Leases not supported"))
     }
 }
 
@@ -71,6 +81,13 @@ pub enum OplockLevel {
     None,
     Read,
     Batch,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LeaseState {
+    pub read: bool,
+    pub write: bool,
+    pub handle: bool,
 }
 
 struct HandleEntry {
@@ -91,6 +108,7 @@ pub struct ConnectionState {
     inner: Box<dyn SMBConnectionInner>,
     handles: HashMap<String, HandleEntry>,
     file_id_map: HashMap<String, String>,
+    lease_key_map: HashMap<String, String>,
     oplock_break_rx: Option<mpsc::Receiver<OplockBreak>>,
     oplock_wait_timeout: tokio::time::Duration,
 }
@@ -99,7 +117,9 @@ pub struct ConnectionState {
 pub struct OplockBreak {
     pub handle_ref: String,
     pub file_id: Option<String>,
+    pub lease_key: Option<String>,
     pub new_level: OplockLevel,
+    pub lease_state: Option<LeaseState>,
 }
 
 impl ConnectionState {
@@ -108,6 +128,7 @@ impl ConnectionState {
             inner,
             handles: HashMap::new(),
             file_id_map: HashMap::new(),
+            lease_key_map: HashMap::new(),
             oplock_break_rx: None,
             oplock_wait_timeout: tokio::time::Duration::from_secs(30),
         }
@@ -158,6 +179,9 @@ impl ConnectionState {
                     if let Some(file_id) = entry.handle.file_id() {
                         self.file_id_map.insert(file_id, handle_ref.clone());
                     }
+                    if let Some(lease_key) = entry.handle.lease_key() {
+                        self.lease_key_map.insert(lease_key, handle_ref.clone());
+                    }
                 }
                 Ok(())
             }
@@ -205,6 +229,9 @@ impl ConnectionState {
                     if let Some(file_id) = entry.handle.file_id() {
                         self.file_id_map.remove(&file_id);
                     }
+                    if let Some(lease_key) = entry.handle.lease_key() {
+                        self.lease_key_map.remove(&lease_key);
+                    }
                     entry.handle.close().await?;
                 }
                 Ok(())
@@ -233,13 +260,18 @@ impl ConnectionState {
     }
 
     pub async fn handle_oplock_break(&mut self, break_msg: OplockBreak) {
-        if break_msg.handle_ref.is_empty() && break_msg.file_id.is_none() {
+        if break_msg.handle_ref.is_empty()
+            && break_msg.file_id.is_none()
+            && break_msg.lease_key.is_none()
+        {
             return;
         }
         let handle_ref = if self.handles.contains_key(&break_msg.handle_ref) {
             Some(break_msg.handle_ref.clone())
         } else if let Some(file_id) = &break_msg.file_id {
             self.file_id_map.get(file_id).cloned()
+        } else if let Some(lease_key) = &break_msg.lease_key {
+            self.lease_key_map.get(lease_key).cloned()
         } else {
             None
         };
@@ -252,7 +284,17 @@ impl ConnectionState {
                 }
                 entry.oplock_state = OplockState::BreakPending { waiters };
 
-                if let Err(err) = entry
+                if let Some(lease_state) = break_msg.lease_state {
+                    if let Some(lease_key) = &break_msg.lease_key {
+                        if let Err(err) = entry
+                            .handle
+                            .acknowledge_lease_break(lease_key, lease_state)
+                            .await
+                        {
+                            tracing::error!(error = %err, "Failed to ACK lease break");
+                        }
+                    }
+                } else if let Err(err) = entry
                     .handle
                     .acknowledge_oplock_break(break_msg.new_level)
                     .await
@@ -354,6 +396,7 @@ mod tests {
 
     struct TestHandle {
         file_id: String,
+        lease_key: Option<String>,
         ack_called: Arc<AtomicBool>,
     }
 
@@ -373,6 +416,10 @@ mod tests {
 
         fn file_id(&self) -> Option<String> {
             Some(self.file_id.clone())
+        }
+
+        fn lease_key(&self) -> Option<String> {
+            self.lease_key.clone()
         }
 
         async fn acknowledge_oplock_break(&self, _new_level: OplockLevel) -> Result<()> {
@@ -435,6 +482,7 @@ mod tests {
             HandleEntry {
                 handle: Box::new(TestHandle {
                     file_id: file_id.clone(),
+                    lease_key: None,
                     ack_called: ack_called.clone(),
                 }),
                 oplock_state: OplockState::None,
@@ -447,7 +495,9 @@ mod tests {
             .handle_oplock_break(OplockBreak {
                 handle_ref: String::new(),
                 file_id: Some(file_id),
+                lease_key: None,
                 new_level: OplockLevel::Read,
+                lease_state: None,
             })
             .await;
 
@@ -472,6 +522,7 @@ mod tests {
             HandleEntry {
                 handle: Box::new(TestHandle {
                     file_id: file_id.clone(),
+                    lease_key: None,
                     ack_called,
                 }),
                 oplock_state: OplockState::BreakPending { waiters: vec![tx] },
@@ -484,7 +535,9 @@ mod tests {
             .handle_oplock_break(OplockBreak {
                 handle_ref,
                 file_id: Some(file_id),
+                lease_key: None,
                 new_level: OplockLevel::Read,
+                lease_state: None,
             })
             .await;
 
@@ -531,6 +584,76 @@ mod tests {
         assert_eq!(last_len.load(AtomicUsizeOrdering::SeqCst), 5);
 
         let _ = std::fs::remove_file(&blob_path);
+    }
+
+    #[tokio::test]
+    async fn test_lease_break_by_lease_key() {
+        let ack_called = Arc::new(AtomicBool::new(false));
+        let lease_key = "lease-key-1".to_string();
+        let handle_ref = "handle-4".to_string();
+
+        struct LeaseHandle {
+            lease_key: String,
+            ack_called: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl SMBFileHandle for LeaseHandle {
+            async fn read(&self, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+
+            async fn write(&self, _offset: u64, data: &[u8]) -> Result<u64> {
+                Ok(data.len() as u64)
+            }
+
+            async fn close(self: Box<Self>) -> Result<()> {
+                Ok(())
+            }
+
+            fn lease_key(&self) -> Option<String> {
+                Some(self.lease_key.clone())
+            }
+
+            async fn acknowledge_lease_break(
+                &self,
+                _lease_key: &str,
+                _lease_state: LeaseState,
+            ) -> Result<()> {
+                self.ack_called.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mut state = ConnectionState::new(Box::new(TestConn));
+        state.handles.insert(
+            handle_ref.clone(),
+            HandleEntry {
+                handle: Box::new(LeaseHandle {
+                    lease_key: lease_key.clone(),
+                    ack_called: ack_called.clone(),
+                }),
+                oplock_state: OplockState::None,
+                path: "/tmp/file".to_string(),
+            },
+        );
+        state.lease_key_map.insert(lease_key.clone(), handle_ref);
+
+        state
+            .handle_oplock_break(OplockBreak {
+                handle_ref: String::new(),
+                file_id: None,
+                lease_key: Some(lease_key),
+                new_level: OplockLevel::None,
+                lease_state: Some(LeaseState {
+                    read: true,
+                    write: false,
+                    handle: true,
+                }),
+            })
+            .await;
+
+        assert!(ack_called.load(Ordering::SeqCst));
     }
 }
 

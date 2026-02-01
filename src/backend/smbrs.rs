@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::backend::{
-    BackendCapabilities, ConnectionState, OplockBreak, OplockLevel, SMBBackend, SMBConnectionInner,
-    SMBFileHandle,
+    BackendCapabilities, ConnectionState, LeaseState, OplockBreak, OplockLevel, SMBBackend,
+    SMBConnectionInner, SMBFileHandle,
 };
 use crate::ir::{OpenMode, Operation};
 
@@ -62,6 +62,7 @@ impl SMBBackend for SmbRsBackend {
         let client = smb::Client::new(smb::ClientConfig::default());
         let conn = client.connect(&self.config.server).await?;
         let mut break_rx = conn.subscribe_oplock_breaks()?;
+        let mut lease_break_rx = conn.subscribe_lease_breaks()?;
 
         let share_path = smb::UncPath::from_str(&format!(
             r"\\{}\\{}",
@@ -72,15 +73,18 @@ impl SMBBackend for SmbRsBackend {
             .await?;
 
         let (tx, rx) = mpsc::channel(64);
+        let tx_oplock = tx.clone();
         tokio::spawn(async move {
             loop {
                 match break_rx.recv().await {
                     Ok(event) => {
-                        let _ = tx
+                        let _ = tx_oplock
                             .send(OplockBreak {
                                 handle_ref: String::new(),
                                 file_id: Some(format!("{:?}", event.file_id)),
+                                lease_key: None,
                                 new_level: map_smb_oplock(event.new_level),
+                                lease_state: None,
                             })
                             .await;
                     }
@@ -90,6 +94,30 @@ impl SMBBackend for SmbRsBackend {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         break;
                     }
+                }
+            }
+        });
+        let tx_lease = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match lease_break_rx.recv().await {
+                    Ok(event) => {
+                        let _ = tx_lease
+                            .send(OplockBreak {
+                                handle_ref: String::new(),
+                                file_id: None,
+                                lease_key: Some(event.lease_key.to_string()),
+                                new_level: OplockLevel::None,
+                                lease_state: Some(LeaseState {
+                                    read: event.new_state.read_caching(),
+                                    write: event.new_state.write_caching(),
+                                    handle: event.new_state.handle_caching(),
+                                }),
+                            })
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -188,16 +216,27 @@ struct SmbRsFileHandle {
     file: smb::File,
     file_id: String,
     granted_oplock: Option<OplockLevel>,
+    lease_key: Option<String>,
 }
 
 impl SmbRsFileHandle {
     fn new(file: smb::File) -> Result<Self> {
         let file_id = format!("{:?}", file.file_id_for_oplock()?);
         let granted_oplock = Some(map_smb_oplock(file.granted_oplock_level()));
+        let lease_key = file.granted_lease().map(|lease| {
+            let lease_key = match lease {
+                smb::RequestLease::RqLsReqv1(v1) => v1.lease_key,
+                smb::RequestLease::RqLsReqv2(v2) => v2.lease_key,
+            };
+            let guid = smb::Guid::try_from(&lease_key.to_le_bytes())
+                .unwrap_or_else(|_| smb::Guid::ZERO);
+            guid.to_string()
+        });
         Ok(Self {
             file,
             file_id,
             granted_oplock,
+            lease_key,
         })
     }
 }
@@ -232,6 +271,10 @@ impl SMBFileHandle for SmbRsFileHandle {
         Some(self.file_id.clone())
     }
 
+    fn lease_key(&self) -> Option<String> {
+        self.lease_key.clone()
+    }
+
     fn granted_oplock(&self) -> Option<OplockLevel> {
         self.granted_oplock
     }
@@ -244,6 +287,22 @@ impl SMBFileHandle for SmbRsFileHandle {
         };
         self.file
             .acknowledge_oplock_break(smb_level)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn acknowledge_lease_break(
+        &self,
+        lease_key: &str,
+        lease_state: LeaseState,
+    ) -> Result<()> {
+        let guid = smb::Guid::from_str(lease_key).map_err(|e| anyhow!(e.to_string()))?;
+        let state = smb::LeaseState::new()
+            .with_read_caching(lease_state.read)
+            .with_write_caching(lease_state.write)
+            .with_handle_caching(lease_state.handle);
+        self.file
+            .acknowledge_lease_break(guid, state)
             .await
             .map_err(|e| anyhow!(e.to_string()))
     }
