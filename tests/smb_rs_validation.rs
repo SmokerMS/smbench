@@ -636,4 +636,64 @@ mod smb_rs_validation {
         breaker.await.context("breaker task join")??;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_extensions_delete_on_close() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs extensions delete test");
+            return Ok(());
+        };
+
+        let backend = SmbRsBackend::new(SmbRsConfig {
+            server: server.clone(),
+            share: share.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+        });
+        let mut conn_state: smbench::backend::ConnectionState =
+            backend.connect("client-delete").await?;
+
+        let file_name = unique_name("smbench_ext_delete");
+        let extensions = serde_json::json!({
+            "create_options": {
+                "non_directory_file": true,
+                "delete_on_close": true
+            },
+            "desired_access": {
+                "generic_all": true
+            },
+            "share_access": {"read": true, "write": true, "delete": true}
+        });
+
+        let open = smbench::ir::Operation::Open {
+            op_id: "op_open".to_string(),
+            client_id: "client-delete".to_string(),
+            timestamp_us: 0,
+            path: file_name.clone(),
+            mode: smbench::ir::OpenMode::ReadWrite,
+            handle_ref: "hdel".to_string(),
+            extensions: Some(extensions),
+        };
+        conn_state.execute(&open).await?;
+
+        let close = smbench::ir::Operation::Close {
+            op_id: "op_close".to_string(),
+            client_id: "client-delete".to_string(),
+            timestamp_us: 1,
+            handle_ref: "hdel".to_string(),
+        };
+        conn_state.execute(&close).await?;
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+        let open_access = FileAccessMask::new().with_generic_read(true);
+        let open_args = FileCreateArgs::make_open_existing(open_access);
+        let target = share_path.with_path(&file_name);
+        let reopened = client.create_file(&target, &open_args).await;
+        assert!(reopened.is_err(), "expected delete-on-close to remove file");
+        client.close().await?;
+
+        Ok(())
+    }
 }
