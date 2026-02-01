@@ -271,6 +271,13 @@ fn resolve_unc_path(share: &smb::UncPath, path: &str) -> Result<smb::UncPath> {
 fn resolve_rename_target(share: &smb::UncPath, dest_path: &str) -> Result<String> {
     if dest_path.starts_with("\\\\") {
         let unc = smb::UncPath::from_str(dest_path)?;
+        if unc.server() != share.server() || unc.share() != share.share() {
+            return Err(anyhow!(
+                "Rename target must be within the same share ({}\\\\{})",
+                share.server(),
+                share.share().unwrap_or_default()
+            ));
+        }
         Ok(unc.path().unwrap_or(dest_path).to_string())
     } else {
         Ok(dest_path.to_string())
@@ -344,5 +351,18 @@ mod tests {
         assert!(access.read());
         assert!(!access.write());
         assert!(access.delete());
+    }
+
+    #[test]
+    fn test_resolve_rename_target() {
+        let share = smb::UncPath::from_str(r"\\server\\share").unwrap();
+        let target = resolve_rename_target(&share, "dir\\file.txt").unwrap();
+        assert_eq!(target, "dir\\file.txt");
+
+        let target = resolve_rename_target(&share, r"\\server\\share\\dir\\file.txt").unwrap();
+        assert_eq!(target, "dir\\file.txt");
+
+        let err = resolve_rename_target(&share, r"\\other\\share\\x.txt").unwrap_err();
+        assert!(err.to_string().contains("same share"));
     }
 }
