@@ -7,7 +7,7 @@ use tokio::time::{sleep, Duration};
 
 use smbench::backend::{ConnectionState, SMBBackend, SMBConnectionInner, SMBFileHandle};
 use smbench::ir::{ClientSpec, Metadata, OpenMode, Operation, WorkloadIr};
-use smbench::scheduler::{Scheduler, SchedulerConfig};
+use smbench::scheduler::{InvariantMode, Scheduler, SchedulerConfig};
 
 struct TestBackend {
     delay: Duration,
@@ -145,6 +145,10 @@ async fn test_scheduler_invariant_no_overlap_single_client() {
             time_scale: 1.0,
             worker_count: 2,
             backend_mode: smbench::backend::BackendMode::Development,
+            invariant_mode: InvariantMode::Panic,
+            debug_dump_on_error: false,
+            watchdog_interval: Duration::from_millis(50),
+            inflight_timeout: Duration::from_secs(2),
         },
     )
     .unwrap();
@@ -171,6 +175,10 @@ async fn test_scheduler_invariant_verification_multi_client() {
             time_scale: 1.0,
             worker_count: 3,
             backend_mode: smbench::backend::BackendMode::Development,
+            invariant_mode: InvariantMode::Panic,
+            debug_dump_on_error: false,
+            watchdog_interval: Duration::from_millis(50),
+            inflight_timeout: Duration::from_secs(2),
         },
     )
     .unwrap();

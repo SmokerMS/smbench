@@ -85,6 +85,7 @@ pub struct ConnectionState {
     inner: Box<dyn SMBConnectionInner>,
     handles: HashMap<String, HandleEntry>,
     oplock_break_rx: Option<mpsc::Receiver<OplockBreak>>,
+    oplock_wait_timeout: tokio::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +100,13 @@ impl ConnectionState {
             inner,
             handles: HashMap::new(),
             oplock_break_rx: None,
+            oplock_wait_timeout: tokio::time::Duration::from_secs(30),
         }
+    }
+
+    pub fn with_oplock_wait_timeout(mut self, timeout: tokio::time::Duration) -> Self {
+        self.oplock_wait_timeout = timeout;
+        self
     }
 
     pub fn with_oplock_channel(mut self, rx: mpsc::Receiver<OplockBreak>) -> Self {
@@ -184,7 +191,10 @@ impl ConnectionState {
             OplockState::BreakPending { waiters } => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 waiters.push(tx);
-                rx.await.map_err(|_| anyhow!("Oplock wait canceled"))?;
+                tokio::time::timeout(self.oplock_wait_timeout, rx)
+                    .await
+                    .map_err(|_| anyhow!("Oplock wait timed out"))?
+                    .map_err(|_| anyhow!("Oplock wait canceled"))?;
             }
             _ => {}
         }
@@ -212,6 +222,11 @@ impl ConnectionState {
                     }
                     entry.oplock_state = OplockState::Broken;
                 }
+            } else {
+                tracing::warn!(
+                    handle_ref = break_msg.handle_ref,
+                    "Received oplock break for unknown handle"
+                );
             }
         }
     }

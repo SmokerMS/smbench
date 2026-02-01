@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc,
+};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -34,6 +37,7 @@ pub struct ClientQueue {
     pub client_id: String,
     pub pending_ops: VecDeque<Operation>,
     pub in_flight_op: Option<String>,
+    pub in_flight_started: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +67,23 @@ pub struct SchedulerConfig {
     pub time_scale: f64,
     pub worker_count: usize,
     pub backend_mode: crate::backend::BackendMode,
+    pub invariant_mode: InvariantMode,
+    pub debug_dump_on_error: bool,
+    pub watchdog_interval: Duration,
+    pub inflight_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum InvariantMode {
+    Panic,
+    LogAndContinue,
+}
+
+#[derive(Debug, Default)]
+struct SchedulerMetrics {
+    dispatch_count: AtomicU64,
+    completion_count: AtomicU64,
+    invariant_violations: AtomicU64,
 }
 
 pub struct Scheduler {
@@ -79,6 +100,11 @@ pub struct Scheduler {
     time_scale: f64,
     worker_count: usize,
     backend_mode: crate::backend::BackendMode,
+    invariant_mode: InvariantMode,
+    debug_dump_on_error: bool,
+    watchdog_interval: Duration,
+    inflight_timeout: Duration,
+    metrics: SchedulerMetrics,
 }
 
 impl Scheduler {
@@ -93,6 +119,7 @@ impl Scheduler {
                 client_id: client.client_id.clone(),
                 pending_ops: VecDeque::new(),
                 in_flight_op: None,
+                in_flight_started: None,
             });
         }
 
@@ -139,6 +166,11 @@ impl Scheduler {
             time_scale: config.time_scale,
             worker_count: config.worker_count,
             backend_mode: config.backend_mode,
+            invariant_mode: config.invariant_mode,
+            debug_dump_on_error: config.debug_dump_on_error,
+            watchdog_interval: config.watchdog_interval,
+            inflight_timeout: config.inflight_timeout,
+            metrics: SchedulerMetrics::default(),
         })
     }
 
@@ -149,6 +181,8 @@ impl Scheduler {
 
         loop {
             if let Some(next_deadline) = self.find_next_eligible_deadline() {
+                let watchdog = tokio::time::sleep(self.watchdog_interval);
+                tokio::pin!(watchdog);
                 tokio::select! {
                     _ = sleep_until(next_deadline) => {
                         if let Some(event) = self.pop_next_eligible_event() {
@@ -157,6 +191,9 @@ impl Scheduler {
                     }
                     Some(completion) = self.completion_rx.recv() => {
                         self.handle_completion(completion).await?;
+                    }
+                    _ = &mut watchdog => {
+                        self.check_inflight_timeouts();
                     }
                     else => {
                         if self.is_complete() {
@@ -168,12 +205,14 @@ impl Scheduler {
                 if self.is_complete() {
                     break;
                 }
-
-                match self.completion_rx.recv().await {
-                    Some(completion) => {
+                tokio::select! {
+                    Some(completion) = self.completion_rx.recv() => {
                         self.handle_completion(completion).await?;
                     }
-                    None => {
+                    _ = tokio::time::sleep(self.watchdog_interval) => {
+                        self.check_inflight_timeouts();
+                    }
+                    else => {
                         return Err(anyhow!("Completion channel closed before completion"));
                     }
                 }
@@ -221,7 +260,10 @@ impl Scheduler {
     async fn dispatch_event(&mut self, event: ScheduledEvent) -> Result<()> {
         let queue = &mut self.client_queues[event.client_idx as usize];
         if queue.in_flight_op.is_some() {
-            return Err(anyhow!("Invariant violation: client already in-flight"));
+            return self.handle_invariant_violation(
+                "Invariant violation: client already in-flight",
+                Some(event),
+            );
         }
 
         let op = queue
@@ -229,6 +271,10 @@ impl Scheduler {
             .pop_front()
             .ok_or_else(|| anyhow!("Queue unexpectedly empty"))?;
         queue.in_flight_op = Some(op.op_id().to_string());
+        queue.in_flight_started = Some(Instant::now());
+        self.metrics
+            .dispatch_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         let permit = self.semaphore.clone().acquire_owned().await?;
         self.work_tx
@@ -245,17 +291,25 @@ impl Scheduler {
     }
 
     async fn handle_completion(&mut self, completion: CompletionEvent) -> Result<()> {
-        let queue = &mut self.client_queues[completion.client_idx as usize];
-        let expected = queue.in_flight_op.as_ref();
-        if expected != Some(&completion.op_id) {
-            return Err(anyhow!(
-                "Completion mismatch: expected {:?}, got {}",
-                expected,
-                completion.op_id
-            ));
+        let expected = self.client_queues[completion.client_idx as usize]
+            .in_flight_op
+            .clone();
+        if expected.as_deref() != Some(&completion.op_id) {
+            return self.handle_invariant_violation(
+                &format!(
+                    "Completion mismatch: expected {:?}, got {}",
+                    expected, completion.op_id
+                ),
+                None,
+            );
         }
 
+        let queue = &mut self.client_queues[completion.client_idx as usize];
         queue.in_flight_op = None;
+        queue.in_flight_started = None;
+        self.metrics
+            .completion_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
         if let Some(next_op) = queue.pending_ops.front() {
             let deadline_us = (next_op.timestamp_us() as f64 * self.time_scale) as u64;
             self.heap.push(std::cmp::Reverse(ScheduledEvent {
@@ -275,12 +329,82 @@ impl Scheduler {
         Ok(())
     }
 
+    fn handle_invariant_violation(
+        &mut self,
+        message: &str,
+        event: Option<ScheduledEvent>,
+    ) -> Result<()> {
+        self.metrics
+            .invariant_violations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::error!(error = message, "Invariant violation");
+        if self.debug_dump_on_error {
+            self.log_state_dump("invariant_violation");
+        }
+        match self.invariant_mode {
+            InvariantMode::Panic => panic!("{message}"),
+            InvariantMode::LogAndContinue => {
+                if let Some(event) = event {
+                    self.heap.push(std::cmp::Reverse(event));
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn is_complete(&self) -> bool {
         self.heap.is_empty()
             && self
                 .client_queues
                 .iter()
                 .all(|q| q.pending_ops.is_empty() && q.in_flight_op.is_none())
+    }
+
+    fn check_inflight_timeouts(&self) {
+        let now = Instant::now();
+        for queue in &self.client_queues {
+            if let (Some(op_id), Some(started)) = (&queue.in_flight_op, queue.in_flight_started) {
+                let elapsed = now.saturating_duration_since(started);
+                if elapsed > self.inflight_timeout {
+                    tracing::warn!(
+                        client_idx = queue.client_idx,
+                        op_id = op_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        "In-flight operation exceeded timeout"
+                    );
+                    if self.debug_dump_on_error {
+                        self.log_state_dump("inflight_timeout");
+                    }
+                }
+            }
+        }
+    }
+
+    fn log_state_dump(&self, reason: &str) {
+        let pending_total: usize = self
+            .client_queues
+            .iter()
+            .map(|q| q.pending_ops.len())
+            .sum();
+        let inflight_total: usize = self
+            .client_queues
+            .iter()
+            .filter(|q| q.in_flight_op.is_some())
+            .count();
+        let violations = self
+            .metrics
+            .invariant_violations
+            .load(AtomicOrdering::Relaxed);
+        tracing::error!(
+            reason = reason,
+            heap_len = self.heap.len(),
+            pending_total = pending_total,
+            inflight_total = inflight_total,
+            dispatch_count = self.metrics.dispatch_count.load(AtomicOrdering::Relaxed),
+            completion_count = self.metrics.completion_count.load(AtomicOrdering::Relaxed),
+            invariant_violations = violations,
+            "Scheduler state dump"
+        );
     }
 
     async fn spawn_workers(&mut self, backend: Arc<dyn SMBBackend>) -> Result<()> {
@@ -377,6 +501,7 @@ mod tests {
     use crate::ir::{ClientSpec, Metadata, Operation, WorkloadIr};
 
     #[tokio::test]
+    #[should_panic(expected = "Completion mismatch")]
     async fn test_completion_mismatch_rejected() {
         let ir = WorkloadIr {
             version: 1,
@@ -404,6 +529,58 @@ mod tests {
                 time_scale: 1.0,
                 worker_count: 1,
                 backend_mode: crate::backend::BackendMode::Development,
+                invariant_mode: InvariantMode::Panic,
+                debug_dump_on_error: false,
+                watchdog_interval: Duration::from_millis(50),
+                inflight_timeout: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+
+        scheduler.client_queues[0].in_flight_op = Some("op_1".to_string());
+
+        let _ = scheduler
+            .handle_completion(CompletionEvent {
+                client_idx: 0,
+                op_id: "wrong_op".to_string(),
+                status: CompletionStatus::Success,
+                latency: Duration::from_millis(1),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_completion_mismatch_log_and_continue() {
+        let ir = WorkloadIr {
+            version: 1,
+            metadata: Metadata {
+                source: "test".to_string(),
+                duration_seconds: 1.0,
+                client_count: 1,
+            },
+            clients: vec![ClientSpec {
+                client_id: "client_1".to_string(),
+                operation_count: 1,
+            }],
+            operations: vec![Operation::Delete {
+                op_id: "op_1".to_string(),
+                client_id: "client_1".to_string(),
+                timestamp_us: 0,
+                path: "/tmp/file".to_string(),
+            }],
+        };
+
+        let mut scheduler = Scheduler::from_ir(
+            ir,
+            SchedulerConfig {
+                max_concurrent: 1,
+                time_scale: 1.0,
+                worker_count: 1,
+                backend_mode: crate::backend::BackendMode::Development,
+                invariant_mode: InvariantMode::LogAndContinue,
+                debug_dump_on_error: false,
+                watchdog_interval: Duration::from_millis(50),
+                inflight_timeout: Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -419,6 +596,10 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_err(), "Expected completion mismatch error");
+        assert!(result.is_ok(), "Expected mismatch to be logged");
+        assert_eq!(
+            scheduler.client_queues[0].in_flight_op.as_deref(),
+            Some("op_1")
+        );
     }
 }
