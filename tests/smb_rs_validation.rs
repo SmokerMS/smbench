@@ -771,4 +771,84 @@ mod smb_rs_validation {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_extensions_access_enforced() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs extensions access test");
+            return Ok(());
+        };
+
+        let seed_client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        seed_client
+            .share_connect(&share_path, &user, pass.clone())
+            .await?;
+
+        let file_name = unique_name("smbench_ext_access");
+        let file_path = share_path.clone().with_path(&file_name);
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = seed_client.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+        seed_client.close().await?;
+
+        let backend = SmbRsBackend::new(SmbRsConfig {
+            server: server.clone(),
+            share: share.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+        });
+        let mut conn_state: smbench::backend::ConnectionState =
+            backend.connect("client-access").await?;
+
+        let extensions = serde_json::json!({
+            "desired_access": {"generic_read": true},
+            "share_access": {"read": true}
+        });
+        let open = smbench::ir::Operation::Open {
+            op_id: "op_open".to_string(),
+            client_id: "client-access".to_string(),
+            timestamp_us: 0,
+            path: file_name.clone(),
+            mode: smbench::ir::OpenMode::Read,
+            handle_ref: "hread".to_string(),
+            extensions: Some(extensions),
+        };
+        conn_state.execute(&open).await?;
+
+        let blob_path = std::env::temp_dir().join("smbench_ext_access_blob");
+        std::fs::write(&blob_path, b"x").expect("write blob");
+        let write = smbench::ir::Operation::Write {
+            op_id: "op_write".to_string(),
+            client_id: "client-access".to_string(),
+            timestamp_us: 1,
+            handle_ref: "hread".to_string(),
+            offset: 0,
+            length: 1,
+            blob_path: blob_path.to_string_lossy().to_string(),
+        };
+        let err = conn_state.execute(&write).await.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("access")
+                || err.to_string().to_lowercase().contains("denied"),
+            "unexpected error: {err}"
+        );
+
+        let close = smbench::ir::Operation::Close {
+            op_id: "op_close".to_string(),
+            client_id: "client-access".to_string(),
+            timestamp_us: 2,
+            handle_ref: "hread".to_string(),
+        };
+        conn_state.execute(&close).await?;
+        let _ = std::fs::remove_file(&blob_path);
+
+        Ok(())
+    }
 }
