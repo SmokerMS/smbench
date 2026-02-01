@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -336,6 +337,7 @@ fn build_args_from_extensions(
     let attributes = parse_file_attributes(extensions).unwrap_or_else(smb::FileAttributes::new);
     let requested_oplock_level = parse_oplock_level(extensions).unwrap_or(smb::OplockLevel::None);
     let share_access = parse_share_access(extensions);
+    let requested_lease = parse_lease_request(extensions);
 
     smb::FileCreateArgs {
         disposition,
@@ -343,7 +345,7 @@ fn build_args_from_extensions(
         options,
         desired_access,
         requested_oplock_level,
-        requested_lease: None,
+        requested_lease,
         share_access,
     }
 }
@@ -392,6 +394,76 @@ fn parse_oplock_level(ext: &serde_json::Value) -> Option<smb::OplockLevel> {
         "exclusive" => Some(smb::OplockLevel::Exclusive),
         _ => None,
     }
+}
+
+fn parse_lease_request(ext: &serde_json::Value) -> Option<smb::RequestLease> {
+    let value = ext.get("lease_request")?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("v2")
+        .to_lowercase();
+    let state_value = value
+        .get("state")
+        .or_else(|| value.get("lease_state"))
+        .unwrap_or(value);
+
+    let lease_state = smb::LeaseState::new()
+        .with_read_caching(
+            state_value
+                .get("read")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_write_caching(
+            state_value
+                .get("write")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+        .with_handle_caching(
+            state_value
+                .get("handle")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        );
+
+    let lease_key = if let Some(key) = value.get("lease_key").and_then(|v| v.as_str()) {
+        guid_to_u128(key).ok()?
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u128
+    };
+
+    if version == "v1" || version == "1" {
+        Some(smb::RequestLease::RqLsReqv1(smb::RequestLeaseV1::new(
+            lease_key, lease_state,
+        )))
+    } else {
+        let mut flags = smb::LeaseFlags::new();
+        let mut parent_key = 0u128;
+        if let Some(parent) = value.get("parent_lease_key").and_then(|v| v.as_str()) {
+            if let Ok(parent_val) = guid_to_u128(parent) {
+                parent_key = parent_val;
+                flags.set_parent_lease_key_set(true);
+            }
+        }
+        let epoch = value
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u16;
+        Some(smb::RequestLease::RqLsReqv2(smb::RequestLeaseV2::new(
+            lease_key, lease_state, flags, parent_key, epoch,
+        )))
+    }
+}
+
+fn guid_to_u128(input: &str) -> Result<u128> {
+    let guid = smb::Guid::from_str(input).map_err(|e| anyhow!(e.to_string()))?;
+    let bytes: [u8; 16] = guid.into();
+    Ok(u128::from_le_bytes(bytes))
 }
 
 fn parse_desired_access(ext: &serde_json::Value) -> Option<smb::FileAccessMask> {
@@ -751,7 +823,8 @@ mod tests {
             },
             "create_disposition": "overwrite_if",
             "create_options": {"write_through": true, "non_directory_file": true},
-            "file_attributes": {"readonly": true}
+            "file_attributes": {"readonly": true},
+            "lease_request": {"version": "v1", "read": true}
         });
         let args = build_args_from_extensions(OpenMode::ReadWrite, &ext);
         assert_eq!(args.disposition, smb::CreateDisposition::OverwriteIf);
@@ -760,6 +833,44 @@ mod tests {
         assert!(args.attributes.readonly());
         assert!(args.desired_access.generic_read());
         assert!(args.desired_access.file_write_data());
+        assert!(args.requested_lease.is_some());
+    }
+
+    #[test]
+    fn test_parse_lease_request_v1() {
+        let ext = serde_json::json!({
+            "lease_request": {
+                "version": "v1",
+                "state": {"read": true}
+            }
+        });
+        let lease = parse_lease_request(&ext).unwrap();
+        match lease {
+            smb::RequestLease::RqLsReqv1(v1) => {
+                assert!(v1.lease_state.read_caching());
+            }
+            _ => panic!("Expected v1 lease request"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lease_request_v2_parent() {
+        let ext = serde_json::json!({
+            "lease_request": {
+                "version": "v2",
+                "state": {"read": true, "handle": true},
+                "parent_lease_key": "b69d8fd8-184b-7c4d-a359-40c8a53cd2b7"
+            }
+        });
+        let lease = parse_lease_request(&ext).unwrap();
+        match lease {
+            smb::RequestLease::RqLsReqv2(v2) => {
+                assert!(v2.lease_state.read_caching());
+                assert!(v2.lease_state.handle_caching());
+                assert!(v2.lease_flags.parent_lease_key_set());
+            }
+            _ => panic!("Expected v2 lease request"),
+        }
     }
 
     #[test]
