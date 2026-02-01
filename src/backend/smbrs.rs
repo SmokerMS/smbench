@@ -97,6 +97,7 @@ impl SMBBackend for SmbRsBackend {
         Ok(ConnectionState::new(Box::new(SmbRsConnection {
             client: Arc::new(client),
             share_path,
+            _conn: conn,
         }))
         .with_oplock_channel(rx))
     }
@@ -105,6 +106,7 @@ impl SMBBackend for SmbRsBackend {
 struct SmbRsConnection {
     client: Arc<smb::Client>,
     share_path: smb::UncPath,
+    _conn: smb::Connection,
 }
 
 #[async_trait]
