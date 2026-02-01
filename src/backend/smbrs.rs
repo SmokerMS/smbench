@@ -133,6 +133,11 @@ impl SMBConnectionInner for SmbRsConnection {
             Ok(file) => file,
             Err((err, _)) => return Err(anyhow!(err)),
         };
+        if let Some(allocation_size) = parse_allocation_size(extensions) {
+            file.set_info(smb::FileAllocationInformation { allocation_size })
+                .await
+                .map_err(|e| anyhow!(e))?;
+        }
         Ok(Box::new(SmbRsFileHandle::new(file)?))
     }
 
@@ -267,12 +272,13 @@ fn build_args_from_extensions(
 
     let disposition = parse_create_disposition(extensions).unwrap_or(smb::CreateDisposition::Open);
     let options = parse_create_options(extensions);
+    let attributes = parse_file_attributes(extensions).unwrap_or_else(smb::FileAttributes::new);
     let requested_oplock_level = parse_oplock_level(extensions).unwrap_or(smb::OplockLevel::None);
     let share_access = parse_share_access(extensions);
 
     smb::FileCreateArgs {
         disposition,
-        attributes: smb::FileAttributes::new(),
+        attributes,
         options,
         desired_access,
         requested_oplock_level,
@@ -339,6 +345,62 @@ fn parse_desired_access(ext: &serde_json::Value) -> Option<smb::FileAccessMask> 
     if value.get("generic_all").and_then(|v| v.as_bool()).unwrap_or(false) {
         access.set_generic_all(true);
     }
+    if value
+        .get("file_read_data")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_read_data(true);
+    }
+    if value
+        .get("file_write_data")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_write_data(true);
+    }
+    if value
+        .get("file_append_data")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_append_data(true);
+    }
+    if value
+        .get("file_read_attributes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_read_attributes(true);
+    }
+    if value
+        .get("file_write_attributes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_write_attributes(true);
+    }
+    if value
+        .get("file_read_ea")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_read_ea(true);
+    }
+    if value
+        .get("file_write_ea")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_write_ea(true);
+    }
+    if value
+        .get("file_execute")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_file_execute(true);
+    }
     Some(access)
 }
 
@@ -389,6 +451,41 @@ fn parse_create_options(ext: &serde_json::Value) -> smb::CreateOptions {
         }
     }
     options
+}
+
+fn parse_file_attributes(ext: &serde_json::Value) -> Option<smb::FileAttributes> {
+    let value = ext.get("file_attributes")?;
+    let mut attrs = smb::FileAttributes::new();
+    if value.get("readonly").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_readonly(true);
+    }
+    if value.get("hidden").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_hidden(true);
+    }
+    if value.get("system").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_system(true);
+    }
+    if value.get("directory").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_directory(true);
+    }
+    if value.get("archive").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_archive(true);
+    }
+    if value.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_temporary(true);
+    }
+    if value
+        .get("not_content_indexed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        attrs.set_not_content_indexed(true);
+    }
+    Some(attrs)
+}
+
+fn parse_allocation_size(ext: &serde_json::Value) -> Option<u64> {
+    ext.get("allocation_size").and_then(|v| v.as_u64())
 }
 
 fn parse_share_access(ext: &serde_json::Value) -> Option<smb::ShareAccessFlags> {
@@ -452,11 +549,16 @@ mod tests {
     #[test]
     fn test_parse_desired_access() {
         let ext = serde_json::json!({
-            "desired_access": {"generic_read": true, "generic_write": true}
+            "desired_access": {
+                "generic_read": true,
+                "generic_write": true,
+                "file_read_data": true
+            }
         });
         let access = parse_desired_access(&ext).unwrap();
         assert!(access.generic_read());
         assert!(access.generic_write());
+        assert!(access.file_read_data());
         assert!(!access.generic_execute());
     }
 
@@ -477,6 +579,22 @@ mod tests {
         let options = parse_create_options(&ext);
         assert!(options.write_through());
         assert!(options.non_directory_file());
+    }
+
+    #[test]
+    fn test_parse_file_attributes() {
+        let ext = serde_json::json!({
+            "file_attributes": {"readonly": true, "hidden": true}
+        });
+        let attrs = parse_file_attributes(&ext).unwrap();
+        assert!(attrs.readonly());
+        assert!(attrs.hidden());
+    }
+
+    #[test]
+    fn test_parse_allocation_size() {
+        let ext = serde_json::json!({"allocation_size": 4096});
+        assert_eq!(parse_allocation_size(&ext), Some(4096));
     }
 
     #[test]
