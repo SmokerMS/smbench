@@ -126,14 +126,7 @@ impl SMBConnectionInner for SmbRsConnection {
         extensions: &serde_json::Value,
     ) -> Result<Box<dyn SMBFileHandle>> {
         let unc_path = resolve_unc_path(&self.share_path, path)?;
-        let mut args = build_args_for_mode(OpenMode::ReadWrite);
-
-        if let Some(oplock) = parse_oplock_level(extensions) {
-            args = args.with_oplock_level(oplock);
-        }
-        if let Some(share_access) = parse_share_access(extensions) {
-            args = args.with_share_access(share_access);
-        }
+        let mut args = build_args_from_extensions(OpenMode::ReadWrite, extensions);
 
         let resource = self.client.create_file(&unc_path, &args).await?;
         let file: smb::File = match resource.try_into() {
@@ -260,6 +253,34 @@ fn build_args_for_mode(mode: OpenMode) -> smb::FileCreateArgs {
     smb::FileCreateArgs::make_open_existing(access)
 }
 
+fn build_args_from_extensions(
+    mode: OpenMode,
+    extensions: &serde_json::Value,
+) -> smb::FileCreateArgs {
+    let desired_access = parse_desired_access(extensions).unwrap_or_else(|| match mode {
+        OpenMode::Read => smb::FileAccessMask::new().with_generic_read(true),
+        OpenMode::Write => smb::FileAccessMask::new().with_generic_write(true),
+        OpenMode::ReadWrite => smb::FileAccessMask::new()
+            .with_generic_read(true)
+            .with_generic_write(true),
+    });
+
+    let disposition = parse_create_disposition(extensions).unwrap_or(smb::CreateDisposition::Open);
+    let options = parse_create_options(extensions);
+    let requested_oplock_level = parse_oplock_level(extensions).unwrap_or(smb::OplockLevel::None);
+    let share_access = parse_share_access(extensions);
+
+    smb::FileCreateArgs {
+        disposition,
+        attributes: smb::FileAttributes::new(),
+        options,
+        desired_access,
+        requested_oplock_level,
+        requested_lease: None,
+        share_access,
+    }
+}
+
 fn resolve_unc_path(share: &smb::UncPath, path: &str) -> Result<smb::UncPath> {
     if path.starts_with("\\\\") {
         Ok(smb::UncPath::from_str(path)?)
@@ -293,6 +314,81 @@ fn parse_oplock_level(ext: &serde_json::Value) -> Option<smb::OplockLevel> {
         "exclusive" => Some(smb::OplockLevel::Exclusive),
         _ => None,
     }
+}
+
+fn parse_desired_access(ext: &serde_json::Value) -> Option<smb::FileAccessMask> {
+    let value = ext.get("desired_access")?;
+    let mut access = smb::FileAccessMask::new();
+    if value.get("generic_read").and_then(|v| v.as_bool()).unwrap_or(false) {
+        access.set_generic_read(true);
+    }
+    if value
+        .get("generic_write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_generic_write(true);
+    }
+    if value
+        .get("generic_execute")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        access.set_generic_execute(true);
+    }
+    if value.get("generic_all").and_then(|v| v.as_bool()).unwrap_or(false) {
+        access.set_generic_all(true);
+    }
+    Some(access)
+}
+
+fn parse_create_disposition(ext: &serde_json::Value) -> Option<smb::CreateDisposition> {
+    let value = ext.get("create_disposition")?.as_str()?.to_lowercase();
+    match value.as_str() {
+        "supersede" => Some(smb::CreateDisposition::Superseded),
+        "open" => Some(smb::CreateDisposition::Open),
+        "create" => Some(smb::CreateDisposition::Create),
+        "open_if" => Some(smb::CreateDisposition::OpenIf),
+        "overwrite" => Some(smb::CreateDisposition::Overwrite),
+        "overwrite_if" => Some(smb::CreateDisposition::OverwriteIf),
+        _ => None,
+    }
+}
+
+fn parse_create_options(ext: &serde_json::Value) -> smb::CreateOptions {
+    let mut options = smb::CreateOptions::new();
+    let value = ext.get("create_options");
+    if let Some(value) = value {
+        if value
+            .get("write_through")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_write_through(true);
+        }
+        if value
+            .get("non_directory_file")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_non_directory_file(true);
+        }
+        if value
+            .get("no_intermediate_buffering")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_no_intermediate_buffering(true);
+        }
+        if value
+            .get("open_requiring_oplock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_open_requiring_oplock(true);
+        }
+    }
+    options
 }
 
 fn parse_share_access(ext: &serde_json::Value) -> Option<smb::ShareAccessFlags> {
@@ -351,6 +447,36 @@ mod tests {
         assert!(access.read());
         assert!(!access.write());
         assert!(access.delete());
+    }
+
+    #[test]
+    fn test_parse_desired_access() {
+        let ext = serde_json::json!({
+            "desired_access": {"generic_read": true, "generic_write": true}
+        });
+        let access = parse_desired_access(&ext).unwrap();
+        assert!(access.generic_read());
+        assert!(access.generic_write());
+        assert!(!access.generic_execute());
+    }
+
+    #[test]
+    fn test_parse_create_disposition() {
+        let ext = serde_json::json!({"create_disposition": "open_if"});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::OpenIf)
+        );
+    }
+
+    #[test]
+    fn test_parse_create_options() {
+        let ext = serde_json::json!({
+            "create_options": {"write_through": true, "non_directory_file": true}
+        });
+        let options = parse_create_options(&ext);
+        assert!(options.write_through());
+        assert!(options.non_directory_file());
     }
 
     #[test]
