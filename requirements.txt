@@ -1,0 +1,16 @@
+# SMB3 Protocol
+impacket>=0.12.0
+
+# PCAP Parsing
+scapy>=2.5.0
+pyshark>=0.6
+
+# LDAP/Active Directory
+ldap3>=2.9.1
+
+# Metrics & Observability
+prometheus-client>=0.20.0
+
+# Utilities
+pyyaml>=6.0
+python-dateutil>=2.9.0
