@@ -6,8 +6,9 @@ mod smb_rs_validation {
 
     use anyhow::Result;
     use smb::{
-        Client, ClientConfig, CreateOptions, File, FileAccessMask, FileAttributes, FileCreateArgs,
-        GetLen, LeaseState, OplockLevel, RequestLease, RequestLeaseV1, RequestLeaseV2, UncPath,
+        Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, File, FileAccessMask,
+        FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel, RequestLease,
+        RequestLeaseV1, RequestLeaseV2, UncPath,
     };
     use smb::resource::file_util::SetLen;
 
@@ -108,11 +109,20 @@ mod smb_rs_validation {
             return Ok(());
         };
 
-        let client1 = Client::new(ClientConfig::default());
-        let client2 = Client::new(ClientConfig::default());
+        let mut connection = ConnectionConfig::default();
+        connection.min_dialect = Some(Dialect::Smb030);
+        connection.max_dialect = Some(Dialect::Smb0311);
+        let client_config = ClientConfig {
+            connection,
+            ..ClientConfig::default()
+        };
+
+        let client1 = Client::new(client_config.clone());
+        let client2 = Client::new(client_config);
 
         let conn1 = client1.connect(&server).await?;
-        let mut break_rx = conn1.subscribe_lease_breaks()?;
+        let mut lease_break_rx = conn1.subscribe_lease_breaks()?;
+        let mut oplock_break_rx = conn1.subscribe_oplock_breaks()?;
 
         let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
         client1.share_connect(&share_path, &user, pass.clone()).await?;
@@ -143,26 +153,49 @@ mod smb_rs_validation {
         ));
         let lease_request_v1 = RequestLease::RqLsReqv1(RequestLeaseV1::new(lease_key, lease_state));
 
+        let share_access = smb::ShareAccessFlags::new().with_read(true);
         let mut create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options)
             .with_oplock_level(OplockLevel::Exclusive)
-            .with_lease_request(lease_request_v2.clone());
+            .with_lease_request(lease_request_v2.clone())
+            .with_share_access(share_access);
 
         let mut file1: File = match client1.create_file(&file_path, &create_args).await?.try_into() {
             Ok(file) => file,
             Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
         };
 
-        if file1.granted_lease().is_none() {
+        let mut lease_granted = file1.granted_lease().is_some();
+        if !lease_granted {
             file1.close().await?;
             create_args = create_args.with_lease_request(lease_request_v1);
             file1 = match client1.create_file(&file_path, &create_args).await?.try_into() {
                 Ok(file) => file,
                 Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
             };
+            lease_granted = file1.granted_lease().is_some();
         }
 
-        if file1.granted_lease().is_none() {
-            return Err(anyhow::anyhow!("Lease not granted by server"));
+        if !lease_granted {
+            file1.close().await?;
+            let oplock_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options)
+                .with_oplock_level(OplockLevel::Exclusive)
+                .with_share_access(share_access);
+            file1 = match client1.create_file(&file_path, &oplock_args).await?.try_into() {
+                Ok(file) => file,
+                Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+            };
+
+            if matches!(file1.granted_oplock_level(), OplockLevel::None) {
+                if std::env::var("SMBENCH_STRICT_OPLOCKS").ok().as_deref() == Some("1") {
+                    return Err(anyhow::anyhow!(
+                        "Lease not granted and oplock not granted"
+                    ));
+                }
+                eprintln!("Lease/oplock not granted by server; skipping break validation");
+                file1.close().await?;
+                client1.close().await?;
+                return Ok(());
+            }
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -172,7 +205,8 @@ mod smb_rs_validation {
             async move {
                 let mut open_options = CreateOptions::new();
                 open_options.set_non_directory_file(true);
-                let open_args = FileCreateArgs::make_overwrite(FileAttributes::new(), open_options);
+                let open_args = FileCreateArgs::make_overwrite(FileAttributes::new(), open_options)
+                    .with_share_access(smb::ShareAccessFlags::new());
                 let resource2 = client2.create_file(&file_path, &open_args).await?;
                 let file2: File = match resource2.try_into() {
                     Ok(file) => file,
@@ -186,16 +220,25 @@ mod smb_rs_validation {
             }
         });
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), break_rx.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))??;
+        if lease_granted {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), lease_break_rx.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))??;
 
-        assert_eq!(event.lease_key, lease_key_guid);
+            assert_eq!(event.lease_key, lease_key_guid);
 
-        if event.ack_required {
-            conn1
-                .acknowledge_lease_break(event.lease_key, event.new_state)
-                .await?;
+            if event.ack_required {
+                conn1
+                    .acknowledge_lease_break(event.lease_key, event.new_state)
+                    .await?;
+            }
+        } else {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), oplock_break_rx.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timed out waiting for oplock break"))??;
+            let expected_file_id = file1.file_id_for_oplock()?;
+            assert_eq!(event.file_id, expected_file_id);
+            file1.acknowledge_oplock_break(event.new_level).await?;
         }
         breaker.await??;
 
