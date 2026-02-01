@@ -696,4 +696,79 @@ mod smb_rs_validation {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_extensions_allocation_size() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs extensions allocation test");
+            return Ok(());
+        };
+
+        let seed_client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        seed_client
+            .share_connect(&share_path, &user, pass.clone())
+            .await?;
+
+        let file_name = unique_name("smbench_ext_alloc");
+        let file_path = share_path.clone().with_path(&file_name);
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = seed_client.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+        seed_client.close().await?;
+
+        let backend = SmbRsBackend::new(SmbRsConfig {
+            server: server.clone(),
+            share: share.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+        });
+        let mut conn_state: smbench::backend::ConnectionState =
+            backend.connect("client-alloc").await?;
+
+        let extensions = serde_json::json!({
+            "allocation_size": 4096,
+            "desired_access": {"generic_all": true},
+            "share_access": {"read": true, "write": true, "delete": true}
+        });
+        let open = smbench::ir::Operation::Open {
+            op_id: "op_open".to_string(),
+            client_id: "client-alloc".to_string(),
+            timestamp_us: 0,
+            path: file_name.clone(),
+            mode: smbench::ir::OpenMode::ReadWrite,
+            handle_ref: "halloc".to_string(),
+            extensions: Some(extensions),
+        };
+        conn_state.execute(&open).await?;
+        let close = smbench::ir::Operation::Close {
+            op_id: "op_close".to_string(),
+            client_id: "client-alloc".to_string(),
+            timestamp_us: 1,
+            handle_ref: "halloc".to_string(),
+        };
+        conn_state.execute(&close).await?;
+
+        let client = Client::new(ClientConfig::default());
+        client.share_connect(&share_path, &user, pass).await?;
+        let open_access = FileAccessMask::new().with_generic_read(true);
+        let open_args = FileCreateArgs::make_open_existing(open_access);
+        let resource = client.create_file(&file_path, &open_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        let len = file.get_len().await?;
+        assert_eq!(len, 0, "expected empty file after allocation");
+        file.close().await?;
+        client.close().await?;
+
+        Ok(())
+    }
 }
