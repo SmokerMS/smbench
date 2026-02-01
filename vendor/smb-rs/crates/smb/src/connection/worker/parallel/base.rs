@@ -111,9 +111,20 @@ where
             // If we have a message ID to notify the error, use it.
             Err(crate::Error::TranformFailed(e)) => match e.msg_id {
                 Some(msg_id) => (Err(crate::Error::TranformFailed(e)), msg_id),
-                None => return Err(Error::TranformFailed(e)),
+                None => {
+                    if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "SMB transform failed before message_id: phase={:?} why={}",
+                            e.phase, e.why
+                        );
+                    }
+                    return Err(Error::TranformFailed(e));
+                }
             },
             Err(e) => {
+                if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                    eprintln!("SMB transform failed: {e:?}");
+                }
                 log::error!("Failed to transform message: {e:?}");
                 return Err(e);
             }
@@ -129,6 +140,13 @@ where
                     | ResponseContent::LeaseBreak(_)
                     | ResponseContent::ServerToClientNotification(_)
             ) {
+                if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                    eprintln!(
+                        "SMB notify: command={:?} message_id={}",
+                        msg.message.header.command,
+                        msg.message.header.message_id
+                    );
+                }
                 if let Some(s2c_channel) = self.notify_messages_channel.get() {
                     log::trace!("Sending notification message to notify channel.");
                     s2c_channel.send(msg).await.map_err(|_| {
@@ -137,6 +155,9 @@ where
                         )
                     })?;
                 } else {
+                    if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                        eprintln!("SMB notify: channel not set");
+                    }
                     log::warn!("Received notification message, but no notify channel is set.");
                 }
                 return Ok(());

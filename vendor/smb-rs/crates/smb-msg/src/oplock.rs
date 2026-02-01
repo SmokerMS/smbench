@@ -41,6 +41,7 @@ impl OplockBreakMsg {
             0 => OplockLevel::None,
             1 => OplockLevel::II,
             2 => OplockLevel::Exclusive,
+            0xFF => OplockLevel::Lease,
             _ => OplockLevel::None,
         }
     }
@@ -110,6 +111,8 @@ pub enum OplockLevel {
     II = 1,
     /// Exclusive oplock is available.
     Exclusive = 2,
+    /// A lease is available (SMB2_OPLOCK_LEVEL_LEASE).
+    Lease = 0xFF,
 }
 
 impl Default for OplockLevel {

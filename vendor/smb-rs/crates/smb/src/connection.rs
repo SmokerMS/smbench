@@ -576,10 +576,15 @@ impl Connection {
         lease_state: LeaseState,
     ) -> crate::Result<()> {
         let request = LeaseBreakAck::new(lease_key, lease_state);
-        let _ = self
-            .handler
-            .sendo_recvo(OutgoingMessage::new(RequestContent::LeaseBreakAck(request)), ReceiveOptions::new())
-            .await?;
+        let session_handler = {
+            let sessions = self.handler.sessions.lock().await?;
+            sessions
+                .values()
+                .find_map(|handler| handler.upgrade())
+                .ok_or_else(|| Error::InvalidState("No session available for lease break ACK".into()))?
+        };
+        let msg = OutgoingMessage::new(RequestContent::LeaseBreakAck(request));
+        let _ = session_handler.sendo_recvo(msg, ReceiveOptions::new()).await?;
         Ok(())
     }
 }
@@ -781,6 +786,9 @@ impl ConnectionMessageHandler {
         let worker = worker.clone();
         const CHANNEL_BUFFER_SIZE: usize = 10;
         let (tx, mut rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
+        if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+            eprintln!("SMB notify: start_notify_channel");
+        }
         worker.start_notify_channel(tx)?;
         let stop_notification = self.stop_notifications.clone();
         let self_clone = self.clone();
@@ -791,11 +799,14 @@ impl ConnectionMessageHandler {
                         log::info!("Notification handler cancelled.");
                         break;
                     }
-                    else => {
-                        while let Some(msg) = rx.recv().await {
-                            self_clone.notify(msg).await.unwrap_or_else(|e| {
-                                log::error!("Error handling notification: {e:?}");
-                            });
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                self_clone.notify(msg).await.unwrap_or_else(|e| {
+                                    log::error!("Error handling notification: {e:?}");
+                                });
+                            }
+                            None => break,
                         }
                     }
                 }
@@ -910,14 +921,24 @@ impl MessageHandler for ConnectionMessageHandler {
     #[maybe_async]
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
         if msg.message.header.session_id == 0 {
-            log::warn!("Received notification without session ID: {msg:?}");
-            return Ok(());
+            if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                eprintln!("SMB notify: session_id=0 for {:?}", msg.message.header.command);
+            } else {
+                log::warn!("Received notification without session ID: {msg:?}");
+            }
         }
 
         #[cfg(feature = "async")]
         match &msg.message.content {
             ResponseContent::OplockBreakNotify(oplock) | ResponseContent::OplockBreak(oplock) => {
                 if let Some(sender) = self.oplock_break_sender.get() {
+                    if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "SMB notify: oplock break file_id={:?} level={:?}",
+                            oplock.file_id(),
+                            oplock.oplock_level()
+                        );
+                    }
                     let _ = sender.send(OplockBreakEvent {
                         file_id: oplock.file_id(),
                         new_level: oplock.oplock_level(),
@@ -926,6 +947,13 @@ impl MessageHandler for ConnectionMessageHandler {
             }
             ResponseContent::LeaseBreakNotify(lease) => {
                 if let Some(sender) = self.lease_break_sender.get() {
+                    if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "SMB notify: lease break lease_key={:?} new_state={:?}",
+                            lease.lease_key(),
+                            lease.new_lease_state()
+                        );
+                    }
                     let _ = sender.send(LeaseBreakEvent {
                         lease_key: lease.lease_key(),
                         new_state: lease.new_lease_state(),

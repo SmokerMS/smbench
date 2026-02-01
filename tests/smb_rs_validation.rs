@@ -4,7 +4,7 @@ mod smb_rs_validation {
     use std::str::FromStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use smb::{
         Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, File, FileAccessMask,
         FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel, RequestLease,
@@ -110,7 +110,6 @@ mod smb_rs_validation {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_smb_rs_oplocks() -> Result<()> {
         let Some((server, share, user, pass)) = smb_env() else {
             eprintln!("SMB env not set; skipping smb-rs lease test");
@@ -120,6 +119,8 @@ mod smb_rs_validation {
         let mut connection = ConnectionConfig::default();
         connection.min_dialect = Some(Dialect::Smb030);
         connection.max_dialect = Some(Dialect::Smb0311);
+        connection.disable_notifications = false;
+        connection.timeout = Some(std::time::Duration::from_secs(60));
         let client_config = ClientConfig {
             connection,
             ..ClientConfig::default()
@@ -128,19 +129,37 @@ mod smb_rs_validation {
         let client1 = Client::new(client_config.clone());
         let client2 = Client::new(client_config);
 
-        let conn1 = client1.connect(&server).await?;
-        let mut lease_break_rx = conn1.subscribe_lease_breaks()?;
-        let mut oplock_break_rx = conn1.subscribe_oplock_breaks()?;
-
         let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
         client1.share_connect(&share_path, &user, pass.clone()).await?;
         client2.share_connect(&share_path, &user, pass).await?;
 
-        let mut options = CreateOptions::new();
-        options.set_non_directory_file(true);
-        options.set_write_through(true);
+        let conn1 = client1.get_connection(&server).await?;
+        let mut lease_break_rx = conn1.subscribe_lease_breaks()?;
+        let mut oplock_break_rx = conn1.subscribe_oplock_breaks()?;
+        if let Some(info) = conn1.conn_info() {
+            eprintln!(
+                "server_caps: leasing={} directory_leasing={} notifications={}",
+                info.negotiation.caps.leasing(),
+                info.negotiation.caps.directory_leasing(),
+                info.negotiation.caps.notifications()
+            );
+        }
+
         let file_name = unique_name("smbench_lease");
         let file_path = share_path.clone().with_path(&file_name);
+
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = client1.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+
+        let mut lease_options = CreateOptions::new();
+        lease_options.set_non_directory_file(true);
 
         let lease_key = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -161,34 +180,78 @@ mod smb_rs_validation {
         ));
         let lease_request_v1 = RequestLease::RqLsReqv1(RequestLeaseV1::new(lease_key, lease_state));
 
-        let share_access = smb::ShareAccessFlags::new().with_read(true);
-        let mut create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options)
-            .with_oplock_level(OplockLevel::Exclusive)
-            .with_lease_request(lease_request_v2.clone())
+        let share_access = smb::ShareAccessFlags::new()
+            .with_read(true)
+            .with_write(true)
+            .with_delete(true);
+        let mut create_args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(true),
+        );
+        create_args.options = lease_options;
+        create_args = create_args
+            .with_lease_request(lease_request_v1.clone())
             .with_share_access(share_access);
 
-        let mut file1: File = match client1.create_file(&file_path, &create_args).await?.try_into() {
+        let file1_resource = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client1.create_file(&file_path, &create_args),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for create (lease v1)"))??;
+        let mut file1: File = match file1_resource.try_into() {
             Ok(file) => file,
             Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
         };
 
         let mut lease_granted = file1.granted_lease().is_some();
+        eprintln!(
+            "lease_granted_v1={lease_granted} oplock_granted={:?}",
+            file1.granted_oplock_level()
+        );
         if !lease_granted {
             file1.close().await?;
-            create_args = create_args.with_lease_request(lease_request_v1);
-            file1 = match client1.create_file(&file_path, &create_args).await?.try_into() {
+            create_args = create_args.with_lease_request(lease_request_v2);
+            let file1_resource = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client1.create_file(&file_path, &create_args),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for create (lease v2)"))??;
+            file1 = match file1_resource.try_into() {
                 Ok(file) => file,
                 Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
             };
             lease_granted = file1.granted_lease().is_some();
+            eprintln!(
+                "lease_granted_v2={lease_granted} oplock_granted={:?}",
+                file1.granted_oplock_level()
+            );
         }
 
         if !lease_granted {
             file1.close().await?;
-            let oplock_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options)
+            let mut oplock_args = FileCreateArgs::make_open_existing(
+                FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true),
+            );
+            let mut oplock_options = CreateOptions::new();
+            oplock_options.set_non_directory_file(true);
+            oplock_options.set_write_through(true);
+            oplock_options.set_open_requiring_oplock(true);
+            oplock_args.options = oplock_options;
+            let oplock_args = oplock_args
                 .with_oplock_level(OplockLevel::Exclusive)
                 .with_share_access(share_access);
-            file1 = match client1.create_file(&file_path, &oplock_args).await?.try_into() {
+            let file1_resource = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                client1.create_file(&file_path, &oplock_args),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for create (oplock)"))??;
+            file1 = match file1_resource.try_into() {
                 Ok(file) => file,
                 Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
             };
@@ -213,9 +276,27 @@ mod smb_rs_validation {
             async move {
                 let mut open_options = CreateOptions::new();
                 open_options.set_non_directory_file(true);
-                let open_args = FileCreateArgs::make_overwrite(FileAttributes::new(), open_options)
-                    .with_share_access(smb::ShareAccessFlags::new());
-                let resource2 = client2.create_file(&file_path, &open_args).await?;
+                let mut access = FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true);
+                access.set_delete(true);
+                let open_args = FileCreateArgs::make_open_existing(access);
+                let open_args = FileCreateArgs {
+                    options: open_options,
+                    ..open_args
+                }
+                .with_share_access(
+                    smb::ShareAccessFlags::new()
+                        .with_read(true)
+                        .with_write(true)
+                        .with_delete(true),
+                );
+                let resource2 = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    client2.create_file(&file_path, &open_args),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Timed out waiting for breaker open"))??;
                 let file2: File = match resource2.try_into() {
                     Ok(file) => file,
                     Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
@@ -229,26 +310,28 @@ mod smb_rs_validation {
         });
 
         if lease_granted {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(15), lease_break_rx.recv())
-                .await
-                .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))??;
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(45), lease_break_rx.recv())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))??;
 
             assert_eq!(event.lease_key, lease_key_guid);
 
             if event.ack_required {
-                conn1
+                file1
                     .acknowledge_lease_break(event.lease_key, event.new_state)
-                    .await?;
+                    .await
+                    .context("lease break ack")?;
             }
         } else {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(15), oplock_break_rx.recv())
+            let event = tokio::time::timeout(std::time::Duration::from_secs(45), oplock_break_rx.recv())
                 .await
                 .map_err(|_| anyhow::anyhow!("Timed out waiting for oplock break"))??;
             let expected_file_id = file1.file_id_for_oplock()?;
             assert_eq!(event.file_id, expected_file_id);
             file1.acknowledge_oplock_break(event.new_level).await?;
         }
-        breaker.await??;
+        breaker.await.context("breaker task join")??;
 
         file1.close().await?;
         client1.close().await?;
@@ -391,36 +474,36 @@ mod smb_rs_validation {
         let file_name = unique_name("smbench_delete_on_close");
         let file_path = share_path.clone().with_path(&file_name);
 
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = client.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+
         let mut options = CreateOptions::new();
         options.set_non_directory_file(true);
         options.set_delete_on_close(true);
-        let mut create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), options);
-        create_args = create_args
-            .with_share_access(smb::ShareAccessFlags::new().with_delete(true));
-        let resource = match client.create_file(&file_path, &create_args).await {
-            Ok(resource) => resource,
-            Err(err) => {
-                eprintln!("Delete-on-close create failed: {err}; falling back to disposition");
-                let create_args = FileCreateArgs::make_overwrite(
-                    FileAttributes::new(),
-                    CreateOptions::new(),
-                );
-                let resource = client.create_file(&file_path, &create_args).await?;
-                let file: File = match resource.try_into() {
-                    Ok(file) => file,
-                    Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
-                };
-                file.set_info(smb::FileDispositionInformation::default())
-                    .await?;
-                file.close().await?;
-                let open_access = FileAccessMask::new().with_generic_read(true);
-                let open_args = FileCreateArgs::make_open_existing(open_access);
-                let reopened = client.create_file(&file_path, &open_args).await;
-                assert!(reopened.is_err(), "expected delete to remove file");
-                client.close().await?;
-                return Ok(());
-            }
+        let mut desired_access = FileAccessMask::new().with_generic_all(true);
+        desired_access.set_delete(true);
+        let delete_args = FileCreateArgs {
+            disposition: smb::CreateDisposition::Open,
+            attributes: FileAttributes::new(),
+            options,
+            desired_access,
+            requested_oplock_level: OplockLevel::None,
+            requested_lease: None,
+            share_access: Some(
+                smb::ShareAccessFlags::new()
+                    .with_read(true)
+                    .with_write(true)
+                    .with_delete(true),
+            ),
         };
+        let resource = client.create_file(&file_path, &delete_args).await?;
         let file: File = match resource.try_into() {
             Ok(file) => file,
             Err((err, _resource)) => return Err(anyhow::anyhow!(err)),

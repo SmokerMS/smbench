@@ -610,10 +610,8 @@ pub struct RequestLeaseV1 {
     /// The requested lease state
     pub lease_state: LeaseState,
     #[bw(calc = 0)]
-    #[br(assert(lease_flags == 0))]
     lease_flags: u32,
     #[bw(calc = 0)]
-    #[br(assert(lease_duration == 0))]
     lease_duration: u64,
 }
 
@@ -639,7 +637,6 @@ pub struct RequestLeaseV2 {
     /// Lease flags
     pub lease_flags: LeaseFlags,
     #[bw(calc = 0)]
-    #[br(assert(lease_duration == 0))]
     lease_duration: u64,
     /// Key that identifies the owner of the lease for the parent directory
     pub parent_lease_key: u128,

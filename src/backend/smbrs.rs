@@ -584,6 +584,7 @@ fn map_smb_oplock(level: smb::OplockLevel) -> OplockLevel {
         smb::OplockLevel::None => OplockLevel::None,
         smb::OplockLevel::II => OplockLevel::Read,
         smb::OplockLevel::Exclusive => OplockLevel::Batch,
+        smb::OplockLevel::Lease => OplockLevel::Batch,
     }
 }
 

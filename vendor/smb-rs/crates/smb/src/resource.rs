@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use maybe_async::*;
-use smb_dtyp::SecurityDescriptor;
+use smb_dtyp::{Guid, SecurityDescriptor};
 use smb_fscc::*;
 use smb_msg::*;
 use time::PrimitiveDateTime;
@@ -154,10 +154,11 @@ impl Resource {
             ));
         }
 
-        let mut contexts = vec![
-            QueryMaximalAccessRequest::default().into(),
-            QueryOnDiskIdReq.into(),
-        ];
+        let mut contexts = Vec::new();
+        if create_args.requested_lease.is_none() {
+            contexts.push(QueryMaximalAccessRequest::default().into());
+            contexts.push(QueryOnDiskIdReq.into());
+        }
         if let Some(lease) = create_args.requested_lease.clone() {
             contexts.push(lease.into());
         }
@@ -869,6 +870,18 @@ impl ResourceHandle {
         let _ = self
             .send_receive(RequestContent::OplockBreakAck(request))
             .await?;
+        Ok(())
+    }
+
+    pub async fn acknowledge_lease_break(
+        &self,
+        lease_key: Guid,
+        lease_state: LeaseState,
+    ) -> crate::Result<()> {
+        let request = LeaseBreakAck::new(lease_key, lease_state);
+        let mut msg = OutgoingMessage::new(RequestContent::LeaseBreakAck(request));
+        msg.has_response = false;
+        let _ = self.handler.sendo(msg).await?;
         Ok(())
     }
 

@@ -535,6 +535,16 @@ impl Client {
             .await
     }
 
+    #[cfg(feature = "async")]
+    pub async fn subscribe_lease_breaks(
+        &self,
+        server: &str,
+    ) -> crate::Result<broadcast::Receiver<crate::connection::LeaseBreakEvent>> {
+        let address = TransportUtils::parse_socket_address(server)?;
+        self._with_connection(address.ip(), |conn| conn.connection.subscribe_lease_breaks())
+            .await
+    }
+
     #[maybe_async]
     async fn _with_connection<F, R>(&self, ip: IpAddr, f: F) -> crate::Result<R>
     where
