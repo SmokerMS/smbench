@@ -587,6 +587,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_break_pending_blocks_io() {
+        let handle_ref = "handle-5".to_string();
+        let mut state = ConnectionState::new(Box::new(TestConn))
+            .with_oplock_wait_timeout(tokio::time::Duration::from_millis(50));
+        state.handles.insert(
+            handle_ref.clone(),
+            HandleEntry {
+                handle: Box::new(TestHandle {
+                    file_id: "file-id-5".to_string(),
+                    lease_key: None,
+                    ack_called: Arc::new(AtomicBool::new(false)),
+                }),
+                oplock_state: OplockState::BreakPending { waiters: Vec::new() },
+                path: "/tmp/file".to_string(),
+            },
+        );
+
+        let op = Operation::Read {
+            op_id: "op_1".to_string(),
+            client_id: "client_1".to_string(),
+            timestamp_us: 0,
+            handle_ref,
+            offset: 0,
+            length: 4,
+        };
+
+        let err = state.execute(&op).await.unwrap_err();
+        assert!(err.to_string().contains("Oplock wait timed out"));
+    }
+
+    #[tokio::test]
     async fn test_lease_break_by_lease_key() {
         let ack_called = Arc::new(AtomicBool::new(false));
         let lease_key = "lease-key-1".to_string();
