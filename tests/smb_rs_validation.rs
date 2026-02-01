@@ -5,6 +5,8 @@ mod smb_rs_validation {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
+    use smbench::backend::smbrs::{SmbRsBackend, SmbRsConfig};
+    use smbench::backend::SMBBackend;
     use smb::{
         Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, File, FileAccessMask,
         FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel, RequestLease,
@@ -516,6 +518,122 @@ mod smb_rs_validation {
         assert!(reopened.is_err(), "expected delete-on-close to remove file");
 
         client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_extensions_lease_break() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs extensions lease test");
+            return Ok(());
+        };
+
+        let seed_client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        seed_client
+            .share_connect(&share_path, &user, pass.clone())
+            .await?;
+
+        let file_name = unique_name("smbench_lease_ext");
+        let file_path = share_path.clone().with_path(&file_name);
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = seed_client.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+        seed_client.close().await?;
+
+        let backend = SmbRsBackend::new(SmbRsConfig {
+            server: server.clone(),
+            share: share.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+        });
+        let mut conn_state: smbench::backend::ConnectionState =
+            backend.connect("client-lease").await?;
+        let mut break_rx = conn_state
+            .take_oplock_receiver()
+            .context("missing break receiver")?;
+
+        let extensions = serde_json::json!({
+            "lease_request": {
+                "version": "v1",
+                "state": {"read": true, "write": true, "handle": true}
+            }
+        });
+        let open = smbench::ir::Operation::Open {
+            op_id: "op_open".to_string(),
+            client_id: "client-lease".to_string(),
+            timestamp_us: 0,
+            path: file_name.clone(),
+            mode: smbench::ir::OpenMode::ReadWrite,
+            handle_ref: "h1".to_string(),
+            extensions: Some(extensions),
+        };
+        conn_state.execute(&open).await?;
+
+        let breaker = tokio::spawn({
+            let server = server.clone();
+            let share = share.clone();
+            let user = user.clone();
+            let pass = pass.clone();
+            let file_path = file_path.clone();
+            async move {
+                let client = Client::new(ClientConfig::default());
+                let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+                client.share_connect(&share_path, &user, pass).await?;
+                let mut access = FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true);
+                access.set_delete(true);
+                let open_args = FileCreateArgs::make_open_existing(access)
+                    .with_share_access(
+                        smb::ShareAccessFlags::new()
+                            .with_read(true)
+                            .with_write(true)
+                            .with_delete(true),
+                    );
+                let resource = client.create_file(&file_path, &open_args).await?;
+                let file: File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+                };
+                let _ = file.write_block(b"x", 0, None).await?;
+                file.flush().await?;
+                file.close().await?;
+                client.close().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        let break_msg = tokio::time::timeout(std::time::Duration::from_secs(45), break_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))?
+            .ok_or_else(|| anyhow::anyhow!("Break channel closed"))?;
+        conn_state.handle_oplock_break(break_msg).await;
+
+        let read = smbench::ir::Operation::Read {
+            op_id: "op_read".to_string(),
+            client_id: "client-lease".to_string(),
+            timestamp_us: 1,
+            handle_ref: "h1".to_string(),
+            offset: 0,
+            length: 1,
+        };
+        conn_state.execute(&read).await?;
+        let close = smbench::ir::Operation::Close {
+            op_id: "op_close".to_string(),
+            client_id: "client-lease".to_string(),
+            timestamp_us: 2,
+            handle_ref: "h1".to_string(),
+        };
+        conn_state.execute(&close).await?;
+
+        breaker.await.context("breaker task join")??;
         Ok(())
     }
 }
