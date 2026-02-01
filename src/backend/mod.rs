@@ -331,6 +331,98 @@ impl SMBFileHandle for NullHandle {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TestHandle {
+        file_id: String,
+        ack_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SMBFileHandle for TestHandle {
+        async fn read(&self, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn write(&self, _offset: u64, data: &[u8]) -> Result<u64> {
+            Ok(data.len() as u64)
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+
+        fn file_id(&self) -> Option<String> {
+            Some(self.file_id.clone())
+        }
+
+        async fn acknowledge_oplock_break(&self, _new_level: OplockLevel) -> Result<()> {
+            self.ack_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct TestConn;
+
+    #[async_trait]
+    impl SMBConnectionInner for TestConn {
+        async fn open_simple(&self, _path: &str, _mode: OpenMode) -> Result<Box<dyn SMBFileHandle>> {
+            Err(anyhow!("not used"))
+        }
+
+        async fn open_extended(
+            &self,
+            _path: &str,
+            _extensions: &serde_json::Value,
+        ) -> Result<Box<dyn SMBFileHandle>> {
+            Err(anyhow!("not used"))
+        }
+
+        async fn execute_misc(&self, _op: &Operation) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_oplock_break_by_file_id() {
+        let ack_called = Arc::new(AtomicBool::new(false));
+        let file_id = "file-id-1".to_string();
+        let handle_ref = "handle-1".to_string();
+
+        let mut state = ConnectionState::new(Box::new(TestConn));
+        state.handles.insert(
+            handle_ref.clone(),
+            HandleEntry {
+                handle: Box::new(TestHandle {
+                    file_id: file_id.clone(),
+                    ack_called: ack_called.clone(),
+                }),
+                oplock_state: OplockState::None,
+                path: "/tmp/file".to_string(),
+            },
+        );
+        state.file_id_map.insert(file_id.clone(), handle_ref.clone());
+
+        state
+            .handle_oplock_break(OplockBreak {
+                handle_ref: String::new(),
+                file_id: Some(file_id),
+                new_level: OplockLevel::Read,
+            })
+            .await;
+
+        let entry = state.handles.get(&handle_ref).unwrap();
+        match entry.oplock_state {
+            OplockState::Broken => {}
+            _ => panic!("Expected Broken oplock state"),
+        }
+        assert!(ack_called.load(Ordering::SeqCst));
+    }
+}
+
 pub struct OSMountBackend {
     #[allow(dead_code)]
     mount_point: Arc<String>,

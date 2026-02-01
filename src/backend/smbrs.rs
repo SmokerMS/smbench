@@ -365,4 +365,18 @@ mod tests {
         let err = resolve_rename_target(&share, r"\\other\\share\\x.txt").unwrap_err();
         assert!(err.to_string().contains("same share"));
     }
+
+    #[test]
+    fn test_resolve_unc_path() {
+        let share = smb::UncPath::from_str(r"\\server\\share").unwrap();
+        let relative = resolve_unc_path(&share, "dir\\file.txt").unwrap();
+        assert_eq!(relative.server(), "server");
+        assert_eq!(relative.share(), Some("share"));
+        assert_eq!(relative.path(), Some("dir\\file.txt"));
+
+        let absolute = resolve_unc_path(&share, r"\\server\\share\\dir\\file.txt").unwrap();
+        assert_eq!(absolute.server(), "server");
+        assert_eq!(absolute.share(), Some("share"));
+        assert_eq!(absolute.path(), Some("dir\\file.txt"));
+    }
 }
