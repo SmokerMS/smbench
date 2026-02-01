@@ -422,11 +422,25 @@ fn parse_create_options(ext: &serde_json::Value) -> smb::CreateOptions {
     let value = ext.get("create_options");
     if let Some(value) = value {
         if value
+            .get("directory_file")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_directory_file(true);
+        }
+        if value
             .get("write_through")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
             options.set_write_through(true);
+        }
+        if value
+            .get("sequential_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_sequential_only(true);
         }
         if value
             .get("non_directory_file")
@@ -443,11 +457,60 @@ fn parse_create_options(ext: &serde_json::Value) -> smb::CreateOptions {
             options.set_no_intermediate_buffering(true);
         }
         if value
+            .get("random_access")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_random_access(true);
+        }
+        if value
+            .get("delete_on_close")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_delete_on_close(true);
+        }
+        if value
+            .get("open_for_backup_intent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_open_for_backup_intent(true);
+        }
+        if value
+            .get("no_compression")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_no_compression(true);
+        }
+        if value
             .get("open_requiring_oplock")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
             options.set_open_requiring_oplock(true);
+        }
+        if value
+            .get("open_reparse_point")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_open_reparse_point(true);
+        }
+        if value
+            .get("open_no_recall")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_open_no_recall(true);
+        }
+        if value
+            .get("open_for_free_space_query")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            options.set_open_for_free_space_query(true);
         }
     }
     options
@@ -470,6 +533,9 @@ fn parse_file_attributes(ext: &serde_json::Value) -> Option<smb::FileAttributes>
     }
     if value.get("archive").and_then(|v| v.as_bool()).unwrap_or(false) {
         attrs.set_archive(true);
+    }
+    if value.get("normal").and_then(|v| v.as_bool()).unwrap_or(false) {
+        attrs.set_normal(true);
     }
     if value.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false) {
         attrs.set_temporary(true);
@@ -574,21 +640,27 @@ mod tests {
     #[test]
     fn test_parse_create_options() {
         let ext = serde_json::json!({
-            "create_options": {"write_through": true, "non_directory_file": true}
+            "create_options": {
+                "write_through": true,
+                "non_directory_file": true,
+                "random_access": true
+            }
         });
         let options = parse_create_options(&ext);
         assert!(options.write_through());
         assert!(options.non_directory_file());
+        assert!(options.random_access());
     }
 
     #[test]
     fn test_parse_file_attributes() {
         let ext = serde_json::json!({
-            "file_attributes": {"readonly": true, "hidden": true}
+            "file_attributes": {"readonly": true, "hidden": true, "archive": true}
         });
         let attrs = parse_file_attributes(&ext).unwrap();
         assert!(attrs.readonly());
         assert!(attrs.hidden());
+        assert!(attrs.archive());
     }
 
     #[test]

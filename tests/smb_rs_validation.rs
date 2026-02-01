@@ -302,4 +302,78 @@ mod smb_rs_validation {
         client.close().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_share_mode_conflict() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs share mode test");
+            return Ok(());
+        };
+
+        let client1 = Client::new(ClientConfig::default());
+        let client2 = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client1.share_connect(&share_path, &user, pass.clone()).await?;
+        client2.share_connect(&share_path, &user, pass).await?;
+
+        let file_name = unique_name("smbench_share_mode");
+        let file_path = share_path.clone().with_path(&file_name);
+
+        let share_read_only = smb::ShareAccessFlags::new().with_read(true);
+        let create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), CreateOptions::new())
+            .with_share_access(share_read_only);
+        let resource = client1.create_file(&file_path, &create_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+
+        let write_access = FileAccessMask::new().with_generic_write(true);
+        let write_args = FileCreateArgs::make_open_existing(write_access)
+            .with_share_access(share_read_only);
+        let second_open = client2.create_file(&file_path, &write_args).await;
+        assert!(second_open.is_err(), "expected share-mode conflict");
+
+        file.close().await?;
+        client1.close().await?;
+        client2.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_access_mask_enforced() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs access mask test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let file_name = unique_name("smbench_access_mask");
+        let file_path = share_path.clone().with_path(&file_name);
+        let create_args = FileCreateArgs::make_overwrite(FileAttributes::new(), CreateOptions::new());
+        let resource = client.create_file(&file_path, &create_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        file.close().await?;
+
+        let read_access = FileAccessMask::new().with_generic_read(true);
+        let read_args = FileCreateArgs::make_open_existing(read_access);
+        let resource = client.create_file(&file_path, &read_args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+
+        let write_result = file.write_block(b"x", 0, None).await;
+        assert!(write_result.is_err(), "expected write to be denied");
+
+        file.close().await?;
+        client.close().await?;
+        Ok(())
+    }
 }
