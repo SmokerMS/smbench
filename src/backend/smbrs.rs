@@ -106,7 +106,7 @@ impl SMBBackend for SmbRsBackend {
 struct SmbRsConnection {
     client: Arc<smb::Client>,
     share_path: smb::UncPath,
-    _conn: smb::Connection,
+    _conn: Arc<smb::Connection>,
 }
 
 #[async_trait]
