@@ -130,3 +130,128 @@ impl Operation {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct WorkloadSummary {
+    pub client_count: usize,
+    pub operation_count: usize,
+    pub open_ops: usize,
+    pub read_ops: usize,
+    pub write_ops: usize,
+    pub close_ops: usize,
+    pub rename_ops: usize,
+    pub delete_ops: usize,
+}
+
+impl WorkloadIr {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!("Unsupported IR version: {}", self.version));
+        }
+        if self.metadata.client_count as usize != self.clients.len() {
+            return Err(format!(
+                "metadata.client_count {} does not match clients length {}",
+                self.metadata.client_count,
+                self.clients.len()
+            ));
+        }
+        let mut client_counts = std::collections::HashMap::new();
+        for client in &self.clients {
+            if client.client_id.trim().is_empty() {
+                return Err("client_id must be non-empty".to_string());
+            }
+            client_counts.insert(client.client_id.clone(), 0usize);
+        }
+        for op in &self.operations {
+            let entry = client_counts
+                .get_mut(op.client_id())
+                .ok_or_else(|| format!("Unknown client_id in op: {}", op.client_id()))?;
+            *entry += 1;
+        }
+        for client in &self.clients {
+            let observed = client_counts.get(&client.client_id).copied().unwrap_or(0);
+            if observed != client.operation_count as usize {
+                return Err(format!(
+                    "client {} operation_count {} does not match observed {}",
+                    client.client_id, client.operation_count, observed
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self) -> WorkloadSummary {
+        let mut summary = WorkloadSummary {
+            client_count: self.clients.len(),
+            operation_count: self.operations.len(),
+            open_ops: 0,
+            read_ops: 0,
+            write_ops: 0,
+            close_ops: 0,
+            rename_ops: 0,
+            delete_ops: 0,
+        };
+        for op in &self.operations {
+            match op {
+                Operation::Open { .. } => summary.open_ops += 1,
+                Operation::Read { .. } => summary.read_ops += 1,
+                Operation::Write { .. } => summary.write_ops += 1,
+                Operation::Close { .. } => summary.close_ops += 1,
+                Operation::Rename { .. } => summary.rename_ops += 1,
+                Operation::Delete { .. } => summary.delete_ops += 1,
+            }
+        }
+        summary
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_counts() {
+        let ir = WorkloadIr {
+            version: 1,
+            metadata: Metadata {
+                source: "test".to_string(),
+                duration_seconds: 1.0,
+                client_count: 1,
+            },
+            clients: vec![ClientSpec {
+                client_id: "client_1".to_string(),
+                operation_count: 1,
+            }],
+            operations: vec![Operation::Delete {
+                op_id: "op_1".to_string(),
+                client_id: "client_1".to_string(),
+                timestamp_us: 0,
+                path: "/tmp/file".to_string(),
+            }],
+        };
+        assert!(ir.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_unknown_client() {
+        let ir = WorkloadIr {
+            version: 1,
+            metadata: Metadata {
+                source: "test".to_string(),
+                duration_seconds: 1.0,
+                client_count: 1,
+            },
+            clients: vec![ClientSpec {
+                client_id: "client_1".to_string(),
+                operation_count: 1,
+            }],
+            operations: vec![Operation::Delete {
+                op_id: "op_1".to_string(),
+                client_id: "missing".to_string(),
+                timestamp_us: 0,
+                path: "/tmp/file".to_string(),
+            }],
+        };
+        assert!(ir.validate().is_err());
+    }
+}

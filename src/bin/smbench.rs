@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use smbench::backend::{BackendMode, SMBBackend};
 use smbench::ir::WorkloadIr;
@@ -51,6 +51,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     debug_dump_on_error: bool,
 
+    /// Validate IR and exit without running
+    #[arg(long, default_value_t = false)]
+    validate_only: bool,
+
+    /// Validate IR and print summary without executing
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
     /// Use JSON logs (default true)
     #[arg(long, default_value_t = true)]
     log_json: bool,
@@ -98,6 +106,28 @@ async fn main() -> Result<()> {
 
     let ir_contents = fs::read_to_string(&cli.ir)?;
     let ir: WorkloadIr = serde_json::from_str(&ir_contents)?;
+    ir.validate().map_err(|err| anyhow!(err))?;
+    let summary = ir.summary();
+
+    if cli.validate_only {
+        println!("IR validation OK");
+        return Ok(());
+    }
+    if cli.dry_run {
+        println!("IR validation OK");
+        println!(
+            "Clients: {} | Ops: {} (open {}, read {}, write {}, close {}, rename {}, delete {})",
+            summary.client_count,
+            summary.operation_count,
+            summary.open_ops,
+            summary.read_ops,
+            summary.write_ops,
+            summary.close_ops,
+            summary.rename_ops,
+            summary.delete_ops
+        );
+        return Ok(());
+    }
 
     let backend: Arc<dyn SMBBackend> = match cli.backend {
         BackendChoice::SmbRs => build_smb_rs_backend()?,
