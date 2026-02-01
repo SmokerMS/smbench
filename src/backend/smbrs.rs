@@ -193,7 +193,7 @@ struct SmbRsFileHandle {
 impl SmbRsFileHandle {
     fn new(file: smb::File) -> Result<Self> {
         let file_id = format!("{:?}", file.file_id_for_oplock()?);
-        let granted_oplock = map_smb_oplock(file.granted_oplock_level());
+        let granted_oplock = Some(map_smb_oplock(file.granted_oplock_level()));
         Ok(Self {
             file,
             file_id,
@@ -264,7 +264,7 @@ fn resolve_unc_path(share: &smb::UncPath, path: &str) -> Result<smb::UncPath> {
     if path.starts_with("\\\\") {
         Ok(smb::UncPath::from_str(path)?)
     } else {
-        Ok(share.with_path(path))
+        Ok(share.clone().with_path(path))
     }
 }
 
@@ -332,20 +332,20 @@ mod tests {
 
     #[test]
     fn test_parse_oplock_level() {
-        let ext = serde_json::json!({\"oplock_level\": \"exclusive\"});
+        let ext = serde_json::json!({"oplock_level": "exclusive"});
         assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::Exclusive));
 
-        let ext = serde_json::json!({\"oplock\": \"ii\"});
+        let ext = serde_json::json!({"oplock": "ii"});
         assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::II));
 
-        let ext = serde_json::json!({\"oplock_level\": \"unknown\"});
+        let ext = serde_json::json!({"oplock_level": "unknown"});
         assert_eq!(parse_oplock_level(&ext), None);
     }
 
     #[test]
     fn test_parse_share_access() {
         let ext = serde_json::json!({
-            \"share_access\": {\"read\": true, \"write\": false, \"delete\": true}
+            "share_access": {"read": true, "write": false, "delete": true}
         });
         let access = parse_share_access(&ext).unwrap();
         assert!(access.read());

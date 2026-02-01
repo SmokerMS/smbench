@@ -95,11 +95,7 @@ impl FileRenameInformation {
     pub fn new(replace_if_exists: bool, file_name: &str) -> Self {
         FileRenameInformation {
             replace_if_exists: replace_if_exists.into(),
-            _reserved: 0,
-            _reserved2: 0,
-            _reserved3: 0,
             root_directory: 0,
-            _file_name_length: 0,
             file_name: SizedWideString::from(file_name),
         }
     }

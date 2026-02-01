@@ -54,7 +54,7 @@ mod smb_rs_validation {
         client.share_connect(&share_path, &user, pass).await?;
 
         let file_name = unique_name("smbench_phase0");
-        let file_path = share_path.with_path(&file_name);
+        let file_path = share_path.clone().with_path(&file_name);
 
         let mut options = CreateOptions::new();
         options.set_write_through(true);
@@ -132,7 +132,7 @@ mod smb_rs_validation {
         options.set_non_directory_file(true);
         options.set_write_through(true);
         let file_name = unique_name("smbench_lease");
-        let file_path = share_path.with_path(&file_name);
+        let file_path = share_path.clone().with_path(&file_name);
 
         let lease_key = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -259,7 +259,7 @@ mod smb_rs_validation {
         client.share_connect(&share_path, &user, pass).await?;
 
         let file_name = unique_name("smbench_rename_src");
-        let file_path = share_path.with_path(&file_name);
+        let file_path = share_path.clone().with_path(&file_name);
 
         let mut options = CreateOptions::new();
         options.set_non_directory_file(true);
