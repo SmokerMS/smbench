@@ -851,4 +851,125 @@ mod smb_rs_validation {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_lease_downgrade() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs lease downgrade test");
+            return Ok(());
+        };
+
+        let mut connection = ConnectionConfig::default();
+        connection.min_dialect = Some(Dialect::Smb030);
+        connection.max_dialect = Some(Dialect::Smb0311);
+        let client_config = ClientConfig {
+            connection,
+            ..ClientConfig::default()
+        };
+
+        let client1 = Client::new(client_config.clone());
+        let client2 = Client::new(client_config);
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client1.share_connect(&share_path, &user, pass.clone()).await?;
+        client2.share_connect(&share_path, &user, pass).await?;
+
+        let conn1 = client1.get_connection(&server).await?;
+        let mut lease_break_rx = conn1.subscribe_lease_breaks()?;
+
+        let file_name = unique_name("smbench_lease_downgrade");
+        let file_path = share_path.clone().with_path(&file_name);
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = client1.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+
+        let lease_key = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u128;
+        let lease_key_guid = smb::Guid::try_from(&lease_key.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid lease key guid: {e}"))?;
+        let lease_state = LeaseState::new()
+            .with_read_caching(true)
+            .with_write_caching(true)
+            .with_handle_caching(true);
+        let lease_request = RequestLease::RqLsReqv1(RequestLeaseV1::new(lease_key, lease_state));
+
+        let share_access = smb::ShareAccessFlags::new()
+            .with_read(true)
+            .with_write(true)
+            .with_delete(true);
+        let mut create_args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_read(true)
+                .with_generic_write(true),
+        );
+        create_args.options = CreateOptions::new().with_non_directory_file(true);
+        create_args = create_args
+            .with_lease_request(lease_request)
+            .with_share_access(share_access);
+        let resource = client1.create_file(&file_path, &create_args).await?;
+        let file1: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+
+        let breaker = tokio::spawn({
+            let file_path = file_path.clone();
+            async move {
+                let mut access = FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true);
+                access.set_delete(true);
+                let open_args = FileCreateArgs::make_open_existing(access)
+                    .with_share_access(
+                        smb::ShareAccessFlags::new()
+                            .with_read(true)
+                            .with_write(true)
+                            .with_delete(true),
+                    );
+                let resource = client2.create_file(&file_path, &open_args).await?;
+                let file2: File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+                };
+                let _ = file2.write_block(b"x", 0, None).await?;
+                file2.flush().await?;
+                file2.close().await?;
+                client2.close().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(45), lease_break_rx.recv())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for lease break"))??;
+        assert_eq!(event.lease_key, lease_key_guid);
+        if std::env::var("SMBENCH_STRICT_LEASE_DOWNGRADE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            assert!(
+                !event.new_state.write_caching(),
+                "expected write caching to be revoked"
+            );
+        }
+        if event.ack_required {
+            file1
+                .acknowledge_lease_break(event.lease_key, event.new_state)
+                .await
+                .context("lease break ack")?;
+        }
+
+        breaker.await.context("breaker task join")??;
+        file1.close().await?;
+        client1.close().await?;
+        Ok(())
+    }
 }
