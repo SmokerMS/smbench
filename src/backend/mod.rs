@@ -179,6 +179,7 @@ impl ConnectionState {
                 handle_ref,
                 offset,
                 blob_path,
+                length,
                 ..
             } => {
                 self.wait_if_blocked_by_handle(handle_ref).await?;
@@ -187,7 +188,16 @@ impl ConnectionState {
                     .get(handle_ref)
                     .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
                 let data = tokio::fs::read(blob_path).await?;
-                entry.handle.write(*offset, &data).await?;
+                let expected_len = (*length) as usize;
+                if expected_len > data.len() {
+                    return Err(anyhow!(
+                        "Write length {} exceeds blob size {}",
+                        expected_len,
+                        data.len()
+                    ));
+                }
+                let slice = &data[..expected_len];
+                entry.handle.write(*offset, slice).await?;
                 Ok(())
             }
             Operation::Close { handle_ref, .. } => {
@@ -236,14 +246,18 @@ impl ConnectionState {
 
         if let Some(handle_ref) = handle_ref {
             if let Some(entry) = self.handles.get_mut(&handle_ref) {
-                entry.oplock_state = OplockState::BreakPending { waiters: Vec::new() };
+                let mut waiters = Vec::new();
+                if let OplockState::BreakPending { waiters: existing } = &mut entry.oplock_state {
+                    waiters.append(existing);
+                }
+                entry.oplock_state = OplockState::BreakPending { waiters };
+
                 if let Err(err) = entry
                     .handle
                     .acknowledge_oplock_break(break_msg.new_level)
                     .await
                 {
                     tracing::error!(error = %err, "Failed to ACK oplock break");
-                    return;
                 }
                 if let OplockState::BreakPending { waiters } = &mut entry.oplock_state {
                     for tx in waiters.drain(..) {
@@ -335,6 +349,8 @@ impl SMBFileHandle for NullHandle {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestHandle {
         file_id: String,
@@ -386,6 +402,27 @@ mod tests {
         }
     }
 
+    struct TestWriteHandle {
+        last_len: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SMBFileHandle for TestWriteHandle {
+        async fn read(&self, _offset: u64, _length: u64) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn write(&self, _offset: u64, data: &[u8]) -> Result<u64> {
+            self.last_len
+                .store(data.len(), AtomicUsizeOrdering::SeqCst);
+            Ok(data.len() as u64)
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_oplock_break_by_file_id() {
         let ack_called = Arc::new(AtomicBool::new(false));
@@ -420,6 +457,80 @@ mod tests {
             _ => panic!("Expected Broken oplock state"),
         }
         assert!(ack_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_oplock_break_preserves_waiters() {
+        let ack_called = Arc::new(AtomicBool::new(false));
+        let file_id = "file-id-2".to_string();
+        let handle_ref = "handle-2".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let mut state = ConnectionState::new(Box::new(TestConn));
+        state.handles.insert(
+            handle_ref.clone(),
+            HandleEntry {
+                handle: Box::new(TestHandle {
+                    file_id: file_id.clone(),
+                    ack_called,
+                }),
+                oplock_state: OplockState::BreakPending { waiters: vec![tx] },
+                path: "/tmp/file".to_string(),
+            },
+        );
+        state.file_id_map.insert(file_id.clone(), handle_ref.clone());
+
+        state
+            .handle_oplock_break(OplockBreak {
+                handle_ref,
+                file_id: Some(file_id),
+                new_level: OplockLevel::Read,
+            })
+            .await;
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), rx)
+            .await
+            .expect("waiter should be released")
+            .expect("waiter should receive");
+    }
+
+    #[tokio::test]
+    async fn test_write_respects_length() {
+        let last_len = Arc::new(AtomicUsize::new(0));
+        let handle_ref = "handle-3".to_string();
+        let mut state = ConnectionState::new(Box::new(TestConn));
+        state.handles.insert(
+            handle_ref.clone(),
+            HandleEntry {
+                handle: Box::new(TestWriteHandle {
+                    last_len: last_len.clone(),
+                }),
+                oplock_state: OplockState::None,
+                path: "/tmp/file".to_string(),
+            },
+        );
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let blob_path = std::env::temp_dir().join(format!("smbench_blob_{unique}.bin"));
+        std::fs::write(&blob_path, b"hello world").expect("write blob");
+
+        let op = Operation::Write {
+            op_id: "op_1".to_string(),
+            client_id: "client_1".to_string(),
+            timestamp_us: 0,
+            handle_ref: handle_ref.clone(),
+            offset: 0,
+            length: 5,
+            blob_path: blob_path.to_string_lossy().to_string(),
+        };
+
+        state.execute(&op).await.expect("write ok");
+        assert_eq!(last_len.load(AtomicUsizeOrdering::SeqCst), 5);
+
+        let _ = std::fs::remove_file(&blob_path);
     }
 }
 

@@ -293,21 +293,32 @@ fn resolve_unc_path(share: &smb::UncPath, path: &str) -> Result<smb::UncPath> {
     if path.starts_with("\\\\") {
         Ok(smb::UncPath::from_str(path)?)
     } else {
-        Ok(share.clone().with_path(path))
+        let share_name = share
+            .share()
+            .ok_or_else(|| anyhow!("Share name missing from base UNC path"))?;
+        let full = format!("\\\\{}\\{}\\{}", share.server(), share_name, path);
+        Ok(smb::UncPath::from_str(&full)?)
     }
 }
 
 fn resolve_rename_target(share: &smb::UncPath, dest_path: &str) -> Result<String> {
     if dest_path.starts_with("\\\\") {
-        let unc = smb::UncPath::from_str(dest_path)?;
-        if unc.server() != share.server() || unc.share() != share.share() {
+        let share_name = share
+            .share()
+            .ok_or_else(|| anyhow!("Share name missing from base UNC path"))?;
+        let prefix = format!("\\\\{}\\{}", share.server(), share_name);
+        if !dest_path
+            .to_lowercase()
+            .starts_with(&prefix.to_lowercase())
+        {
             return Err(anyhow!(
                 "Rename target must be within the same share ({}\\\\{})",
                 share.server(),
-                share.share().unwrap_or_default()
+                share_name
             ));
         }
-        Ok(unc.path().unwrap_or(dest_path).to_string())
+        let relative = dest_path[prefix.len()..].trim_start_matches('\\');
+        Ok(relative.to_string())
     } else {
         Ok(dest_path.to_string())
     }
@@ -694,26 +705,26 @@ mod tests {
 
     #[test]
     fn test_resolve_rename_target() {
-        let share = smb::UncPath::from_str(r"\\server\\share").unwrap();
+        let share = smb::UncPath::from_str(r"\\server\share").unwrap();
         let target = resolve_rename_target(&share, "dir\\file.txt").unwrap();
         assert_eq!(target, "dir\\file.txt");
 
-        let target = resolve_rename_target(&share, r"\\server\\share\\dir\\file.txt").unwrap();
+        let target = resolve_rename_target(&share, r"\\server\share\dir\file.txt").unwrap();
         assert_eq!(target, "dir\\file.txt");
 
-        let err = resolve_rename_target(&share, r"\\other\\share\\x.txt").unwrap_err();
+        let err = resolve_rename_target(&share, r"\\other\share\x.txt").unwrap_err();
         assert!(err.to_string().contains("same share"));
     }
 
     #[test]
     fn test_resolve_unc_path() {
-        let share = smb::UncPath::from_str(r"\\server\\share").unwrap();
+        let share = smb::UncPath::from_str(r"\\server\share").unwrap();
         let relative = resolve_unc_path(&share, "dir\\file.txt").unwrap();
         assert_eq!(relative.server(), "server");
         assert_eq!(relative.share(), Some("share"));
         assert_eq!(relative.path(), Some("dir\\file.txt"));
 
-        let absolute = resolve_unc_path(&share, r"\\server\\share\\dir\\file.txt").unwrap();
+        let absolute = resolve_unc_path(&share, r"\\server\share\dir\file.txt").unwrap();
         assert_eq!(absolute.server(), "server");
         assert_eq!(absolute.share(), Some("share"));
         assert_eq!(absolute.path(), Some("dir\\file.txt"));

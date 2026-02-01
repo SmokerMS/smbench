@@ -291,6 +291,12 @@ impl Scheduler {
     }
 
     async fn handle_completion(&mut self, completion: CompletionEvent) -> Result<()> {
+        if completion.client_idx as usize >= self.client_queues.len() {
+            return self.handle_invariant_violation(
+                &format!("Completion client_idx out of range: {}", completion.client_idx),
+                None,
+            );
+        }
         let expected = self.client_queues[completion.client_idx as usize]
             .in_flight_op
             .clone();
@@ -610,5 +616,53 @@ mod tests {
             scheduler.client_queues[0].in_flight_op.as_deref(),
             Some("op_1")
         );
+    }
+
+    #[tokio::test]
+    async fn test_completion_invalid_client_idx_log_and_continue() {
+        let ir = WorkloadIr {
+            version: 1,
+            metadata: Metadata {
+                source: "test".to_string(),
+                duration_seconds: 1.0,
+                client_count: 1,
+            },
+            clients: vec![ClientSpec {
+                client_id: "client_1".to_string(),
+                operation_count: 1,
+            }],
+            operations: vec![Operation::Delete {
+                op_id: "op_1".to_string(),
+                client_id: "client_1".to_string(),
+                timestamp_us: 0,
+                path: "/tmp/file".to_string(),
+            }],
+        };
+
+        let mut scheduler = Scheduler::from_ir(
+            ir,
+            SchedulerConfig {
+                max_concurrent: 1,
+                time_scale: 1.0,
+                worker_count: 1,
+                backend_mode: crate::backend::BackendMode::Development,
+                invariant_mode: InvariantMode::LogAndContinue,
+                debug_dump_on_error: false,
+                watchdog_interval: Duration::from_millis(50),
+                inflight_timeout: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+
+        let result = scheduler
+            .handle_completion(CompletionEvent {
+                client_idx: 99,
+                op_id: "op_1".to_string(),
+                status: CompletionStatus::Success,
+                latency: Duration::from_millis(1),
+            })
+            .await;
+
+        assert!(result.is_ok(), "Expected out-of-range to be logged");
     }
 }
