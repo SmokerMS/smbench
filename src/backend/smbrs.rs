@@ -126,7 +126,7 @@ impl SMBConnectionInner for SmbRsConnection {
         extensions: &serde_json::Value,
     ) -> Result<Box<dyn SMBFileHandle>> {
         let unc_path = resolve_unc_path(&self.share_path, path)?;
-        let mut args = build_args_from_extensions(OpenMode::ReadWrite, extensions);
+        let args = build_args_from_extensions(OpenMode::ReadWrite, extensions);
 
         let resource = self.client.create_file(&unc_path, &args).await?;
         let file: smb::File = match resource.try_into() {
