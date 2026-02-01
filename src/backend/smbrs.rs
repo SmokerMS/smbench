@@ -5,7 +5,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::backend::{BackendCapabilities, ConnectionState, OplockBreak, OplockLevel, SMBBackend, SMBConnectionInner, SMBFileHandle};
+use crate::backend::{
+    BackendCapabilities, ConnectionState, OplockBreak, OplockLevel, SMBBackend, SMBConnectionInner,
+    SMBFileHandle,
+};
 use crate::ir::{OpenMode, Operation};
 
 #[derive(Clone, Debug)]
@@ -75,7 +78,7 @@ impl SMBBackend for SmbRsBackend {
                     Ok(event) => {
                         let _ = tx
                             .send(OplockBreak {
-                                handle_ref: format!("{:?}", event.file_id),
+                                handle_ref: String::new(),
                                 file_id: Some(format!("{:?}", event.file_id)),
                                 new_level: map_smb_oplock(event.new_level),
                             })
@@ -142,8 +145,40 @@ impl SMBConnectionInner for SmbRsConnection {
 
     async fn execute_misc(&self, op: &Operation) -> Result<()> {
         match op {
-            Operation::Rename { .. } => Err(anyhow!("Rename not implemented for smb-rs backend")),
-            Operation::Delete { .. } => Err(anyhow!("Delete not implemented for smb-rs backend")),
+            Operation::Rename {
+                source_path,
+                dest_path,
+                ..
+            } => {
+                let source = resolve_unc_path(&self.share_path, source_path)?;
+                let dest = resolve_rename_target(&self.share_path, dest_path)?;
+                let access = smb::FileAccessMask::new().with_generic_all(true);
+                let args = smb::FileCreateArgs::make_open_existing(access);
+                let resource = self.client.create_file(&source, &args).await?;
+                let file: smb::File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _)) => return Err(anyhow!(err)),
+                };
+                let rename = smb::FileRenameInformation::new(false, dest.as_str());
+                file.set_info(rename).await.map_err(|e| anyhow!(e))?;
+                file.close().await.map_err(|e| anyhow!(e))?;
+                Ok(())
+            }
+            Operation::Delete { path, .. } => {
+                let target = resolve_unc_path(&self.share_path, path)?;
+                let access = smb::FileAccessMask::new().with_generic_all(true);
+                let args = smb::FileCreateArgs::make_open_existing(access);
+                let resource = self.client.create_file(&target, &args).await?;
+                let file: smb::File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _)) => return Err(anyhow!(err)),
+                };
+                file.set_info(smb::FileDispositionInformation::default())
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+                file.close().await.map_err(|e| anyhow!(e))?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -230,6 +265,15 @@ fn resolve_unc_path(share: &smb::UncPath, path: &str) -> Result<smb::UncPath> {
         Ok(smb::UncPath::from_str(path)?)
     } else {
         Ok(share.with_path(path))
+    }
+}
+
+fn resolve_rename_target(share: &smb::UncPath, dest_path: &str) -> Result<String> {
+    if dest_path.starts_with("\\\\") {
+        let unc = smb::UncPath::from_str(dest_path)?;
+        Ok(unc.path().unwrap_or(dest_path).to_string())
+    } else {
+        Ok(dest_path.to_string())
     }
 }
 
