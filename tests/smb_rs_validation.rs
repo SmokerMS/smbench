@@ -13,7 +13,7 @@ mod smb_rs_validation {
         FileAccessMask, FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel,
         RequestLease, RequestLeaseV1, RequestLeaseV2, UncPath,
     };
-    use smb::resource::file_util::SetLen;
+    use smb::resource::file_util::{SetLen, block_copy};
     use smb_msg::NotifyFilter;
     use smb_fscc::{
         DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsAttributeInformation,
@@ -1404,6 +1404,75 @@ mod smb_rs_validation {
         );
 
         directory.close().await?;
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_block_copy() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs block copy test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let src_name = unique_name("smbench_block_copy_src");
+        let dst_name = unique_name("smbench_block_copy_dst");
+        let src_path = share_path.clone().with_path(&src_name);
+        let dst_path = share_path.clone().with_path(&dst_name);
+
+        let create_args = FileCreateArgs::make_overwrite(
+            FileAttributes::new(),
+            CreateOptions::new().with_non_directory_file(true),
+        );
+        let src = client
+            .create_file(&src_path, &create_args)
+            .await?
+            .unwrap_file();
+        let dst = client
+            .create_file(&dst_path, &create_args)
+            .await?
+            .unwrap_file();
+
+        let data = vec![0x5a; 128 * 1024];
+        src.write_block(&data, 0, None).await?;
+        src.set_len(data.len() as u64).await?;
+        src.flush().await?;
+
+        block_copy(src, dst, 4).await?;
+
+        let read_args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_read(true),
+        );
+        let file = client.create_file(&dst_path, &read_args).await?;
+        let file = file.unwrap_file();
+        let mut buf = vec![0u8; data.len()];
+        let read = file.read_block(&mut buf, 0, None, true).await?;
+        assert_eq!(read, data.len());
+        assert_eq!(buf, data);
+        file.close().await?;
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(file) = client.create_file(&src_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
+        }
+        if let Ok(file) = client.create_file(&dst_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
+        }
+
         client.close().await?;
         Ok(())
     }
