@@ -16,8 +16,8 @@ mod smb_rs_validation {
     use smb::resource::file_util::SetLen;
     use smb_msg::NotifyFilter;
     use smb_fscc::{
-        DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsSizeInformation,
-        FileStandardInformation,
+        DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsAttributeInformation,
+        FileFsSizeInformation, FileStandardInformation,
     };
     use std::sync::Arc;
 
@@ -1312,6 +1312,12 @@ mod smb_rs_validation {
         assert!(
             fs_info.sectors_per_allocation_unit > 0,
             "invalid sectors_per_allocation_unit"
+        );
+
+        let fs_attrs: FileFsAttributeInformation = directory.query_fs_info().await?;
+        assert!(
+            !fs_attrs.file_system_name.to_string().is_empty(),
+            "expected file system name"
         );
 
         directory.close().await?;
