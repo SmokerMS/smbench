@@ -20,6 +20,7 @@ mod smb_rs_validation {
         DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsAttributeInformation,
         FileFsSizeInformation, FileStandardInformation,
     };
+    use tokio_util::sync::CancellationToken;
     use std::sync::Arc;
 
     fn smb_env() -> Option<(String, String, String, String)> {
@@ -1185,6 +1186,75 @@ mod smb_rs_validation {
 
         client1.close().await?;
         client2.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_change_notify_cancel() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs change notify cancel test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let dir_name = unique_name("smbench_notify_cancel_dir");
+        let dir_path = share_path.clone().with_path(&dir_name);
+        let create_dir_args = FileCreateArgs::make_create_new(
+            FileAttributes::new().with_directory(true),
+            CreateOptions::new().with_directory_file(true),
+        );
+        client
+            .create_file(&dir_path, &create_dir_args)
+            .await?
+            .unwrap_dir()
+            .close()
+            .await?;
+
+        let directory = client
+            .create_file(
+                &dir_path,
+                &FileCreateArgs::make_open_existing(
+                    DirAccessMask::new().with_list_directory(true).into(),
+                ),
+            )
+            .await?
+            .unwrap_dir();
+        let directory = Arc::new(directory);
+
+        let cancel = CancellationToken::new();
+        let mut stream =
+            Directory::watch_stream_cancellable(&directory, NotifyFilter::all(), false, cancel.clone())?;
+        cancel.cancel();
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await?;
+        if let Some(result) = next {
+            if let Err(err) = result {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("cancel"),
+                    "unexpected cancellation error: {msg}"
+                );
+            }
+        }
+
+        directory.close().await?;
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(dir) = client.create_file(&dir_path, &cleanup_open).await {
+            let dir = dir.unwrap_dir();
+            let _ = dir
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = dir.close().await;
+        }
+
+        client.close().await?;
         Ok(())
     }
 

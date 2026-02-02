@@ -2543,6 +2543,7 @@ dependencies = [
  "smb-msg",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
