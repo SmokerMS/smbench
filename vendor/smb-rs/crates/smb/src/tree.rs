@@ -253,6 +253,16 @@ impl Tree {
             .parse_fsctl::<T::Response>()?;
         Ok(response)
     }
+
+    /// Returns the share flags negotiated for this tree connection.
+    pub fn share_flags(&self) -> crate::Result<ShareFlags> {
+        self.handler.info().map(|info| info.share_flags)
+    }
+
+    /// Returns the share type negotiated for this tree connection.
+    pub fn share_type(&self) -> crate::Result<ShareType> {
+        self.handler.info().map(|info| info.share_type)
+    }
 }
 
 pub(crate) struct TreeMessageHandler {

@@ -1097,4 +1097,39 @@ mod smb_rs_validation {
         client2.close().await?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_smb_rs_share_capabilities() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs share capabilities test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let conn = client.get_connection(&server).await?;
+        if let Some(info) = conn.conn_info() {
+            assert!(
+                info.negotiation.caps.notifications(),
+                "server should advertise notify capability"
+            );
+        }
+
+        let tree = client.get_tree(&share_path).await?;
+        if std::env::var("SMBENCH_STRICT_ENCRYPT_SHARE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            assert!(
+                tree.share_flags()?.encrypt_data(),
+                "expected share encryption flag to be set"
+            );
+        }
+
+        client.close().await?;
+        Ok(())
+    }
 }
