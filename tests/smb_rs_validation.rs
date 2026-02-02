@@ -16,7 +16,8 @@ mod smb_rs_validation {
     use smb::resource::file_util::SetLen;
     use smb_msg::NotifyFilter;
     use smb_fscc::{
-        DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileStandardInformation,
+        DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsSizeInformation,
+        FileStandardInformation,
     };
     use std::sync::Arc;
 
@@ -1281,6 +1282,39 @@ mod smb_rs_validation {
             let _ = file.close().await;
         }
 
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_query_fs_info() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs query fs info test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let directory = client
+            .create_file(
+                &share_path,
+                &FileCreateArgs::make_open_existing(
+                    DirAccessMask::new().with_list_directory(true).into(),
+                ),
+            )
+            .await?
+            .unwrap_dir();
+
+        let fs_info: FileFsSizeInformation = directory.query_fs_info().await?;
+        assert!(fs_info.bytes_per_sector > 0, "invalid bytes_per_sector");
+        assert!(
+            fs_info.sectors_per_allocation_unit > 0,
+            "invalid sectors_per_allocation_unit"
+        );
+
+        directory.close().await?;
         client.close().await?;
         Ok(())
     }
