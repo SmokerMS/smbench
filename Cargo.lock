@@ -2538,6 +2538,8 @@ dependencies = [
  "serde",
  "serde_json",
  "smb",
+ "smb-fscc",
+ "smb-msg",
  "tokio",
  "tokio-test",
  "tracing",

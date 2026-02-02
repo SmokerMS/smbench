@@ -8,11 +8,12 @@ mod smb_rs_validation {
     use smbench::backend::smbrs::{SmbRsBackend, SmbRsConfig};
     use smbench::backend::SMBBackend;
     use smb::{
-        Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, File, FileAccessMask,
-        FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel, RequestLease,
-        RequestLeaseV1, RequestLeaseV2, UncPath,
+        Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, Directory, File,
+        FileAccessMask, FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel,
+        RequestLease, RequestLeaseV1, RequestLeaseV2, UncPath,
     };
     use smb::resource::file_util::SetLen;
+    use smb_msg::NotifyFilter;
 
     fn smb_env() -> Option<(String, String, String, String)> {
         let server = env::var("SMBENCH_SMB_SERVER").ok()?;
@@ -1027,6 +1028,73 @@ mod smb_rs_validation {
         }
         file.close().await?;
         client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_change_notify() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs change notify test");
+            return Ok(());
+        };
+
+        let client1 = Client::new(ClientConfig::default());
+        let client2 = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client1.share_connect(&share_path, &user, pass.clone()).await?;
+        client2.share_connect(&share_path, &user, pass).await?;
+
+        let dir_name = unique_name("smbench_notify_dir");
+        let dir_path = share_path.clone().with_path(&dir_name);
+        let create_dir_args = FileCreateArgs::make_create_new(
+            FileAttributes::new().with_directory(true),
+            CreateOptions::new().with_directory_file(true),
+        );
+        let dir_resource = client1.create_file(&dir_path, &create_dir_args).await?;
+        let dir_resource = dir_resource.unwrap_dir();
+
+        let watch_handle: Directory = dir_resource;
+        let notify_task = tokio::spawn(async move {
+            watch_handle
+                .watch_timeout(NotifyFilter::all(), false, std::time::Duration::from_secs(10))
+                .await
+        });
+
+        let file_name = format!("{dir_name}\\notify.txt");
+        let file_path = share_path.clone().with_path(&file_name);
+        let file_args = FileCreateArgs::make_create_new(
+            FileAttributes::new(),
+            CreateOptions::new().with_non_directory_file(true),
+        );
+        let file = client2.create_file(&file_path, &file_args).await?;
+        file.unwrap_file().close().await?;
+
+        let notify_result = notify_task.await??;
+        assert!(
+            !notify_result.is_empty(),
+            "expected at least one notify event"
+        );
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(file) = client2.create_file(&file_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
+        }
+        if let Ok(dir) = client1.create_file(&dir_path, &cleanup_open).await {
+            let dir = dir.unwrap_dir();
+            let _ = dir
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = dir.close().await;
+        }
+
+        client1.close().await?;
+        client2.close().await?;
         Ok(())
     }
 }
