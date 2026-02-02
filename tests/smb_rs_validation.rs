@@ -1105,6 +1105,89 @@ mod smb_rs_validation {
     }
 
     #[tokio::test]
+    async fn test_smb_rs_change_notify_stream() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs change notify stream test");
+            return Ok(());
+        };
+
+        let client1 = Client::new(ClientConfig::default());
+        let client2 = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client1.share_connect(&share_path, &user, pass.clone()).await?;
+        client2.share_connect(&share_path, &user, pass).await?;
+
+        let dir_name = unique_name("smbench_notify_stream_dir");
+        let dir_path = share_path.clone().with_path(&dir_name);
+        let create_dir_args = FileCreateArgs::make_create_new(
+            FileAttributes::new().with_directory(true),
+            CreateOptions::new().with_directory_file(true),
+        );
+        client1
+            .create_file(&dir_path, &create_dir_args)
+            .await?
+            .unwrap_dir()
+            .close()
+            .await?;
+
+        let directory = client1
+            .create_file(
+                &dir_path,
+                &FileCreateArgs::make_open_existing(
+                    DirAccessMask::new().with_list_directory(true).into(),
+                ),
+            )
+            .await?
+            .unwrap_dir();
+        let directory = Arc::new(directory);
+        let mut stream = Directory::watch_stream(&directory, NotifyFilter::all(), false)?;
+
+        let file_name = format!("{dir_name}\\notify_stream.txt");
+        let file_path = share_path.clone().with_path(&file_name);
+        let file_args = FileCreateArgs::make_create_new(
+            FileAttributes::new(),
+            CreateOptions::new().with_non_directory_file(true),
+        );
+        client2
+            .create_file(&file_path, &file_args)
+            .await?
+            .unwrap_file()
+            .close()
+            .await?;
+
+        let _event = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.next(),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("notify stream ended"))??;
+
+        directory.close().await?;
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(file) = client2.create_file(&file_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
+        }
+        if let Ok(dir) = client1.create_file(&dir_path, &cleanup_open).await {
+            let dir = dir.unwrap_dir();
+            let _ = dir
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = dir.close().await;
+        }
+
+        client1.close().await?;
+        client2.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_smb_rs_share_capabilities() -> Result<()> {
         let Some((server, share, user, pass)) = smb_env() else {
             eprintln!("SMB env not set; skipping smb-rs share capabilities test");
