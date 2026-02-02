@@ -13,6 +13,7 @@ mod smb_rs_validation {
         FileAccessMask, FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel,
         RequestLease, RequestLeaseV1, RequestLeaseV2, UncPath,
     };
+    use smb::connection::config::MultiChannelConfig;
     use smb::resource::file_util::{SetLen, block_copy};
     use smb_msg::{EchoRequest, NotifyFilter, RequestContent};
     use smb_fscc::{
@@ -1502,6 +1503,50 @@ mod smb_rs_validation {
         assert_eq!(responses.len(), 2);
         for response in responses {
             response.message.content.as_echo()?;
+        }
+
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_multichannel_capability() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs multichannel test");
+            return Ok(());
+        };
+
+        let enable_multichannel = std::env::var("SMBENCH_ENABLE_MULTICHANNEL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let strict_multichannel = std::env::var("SMBENCH_STRICT_MULTICHANNEL")
+            .ok()
+            .as_deref()
+            == Some("1");
+
+        let mut client_config = ClientConfig::default();
+        if enable_multichannel {
+            client_config.connection.multichannel = MultiChannelConfig::Always;
+        }
+        let client = Client::new(client_config);
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let conn = client.get_connection(&server).await?;
+        let caps = conn
+            .conn_info()
+            .map(|info| info.negotiation.caps.multi_channel())
+            .unwrap_or(false);
+
+        if enable_multichannel && caps {
+            let channels = client.get_channels(&share_path).await?;
+            if strict_multichannel {
+                assert!(
+                    !channels.is_empty(),
+                    "expected multichannel connections"
+                );
+            }
         }
 
         client.close().await?;
