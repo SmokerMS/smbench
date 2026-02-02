@@ -39,6 +39,7 @@ pub struct FileCreateArgs {
     pub desired_access: FileAccessMask,
     pub requested_oplock_level: OplockLevel,
     pub requested_lease: Option<RequestLease>,
+    pub requested_durable: Option<DurableHandleRequestV2>,
     pub share_access: Option<ShareAccessFlags>,
 }
 
@@ -51,6 +52,7 @@ impl FileCreateArgs {
             desired_access: access,
             requested_oplock_level: OplockLevel::None,
             requested_lease: None,
+            requested_durable: None,
             share_access: None,
         }
     }
@@ -65,6 +67,7 @@ impl FileCreateArgs {
             desired_access: FileAccessMask::new().with_generic_all(true),
             requested_oplock_level: OplockLevel::None,
             requested_lease: None,
+            requested_durable: None,
             share_access: None,
         }
     }
@@ -80,6 +83,7 @@ impl FileCreateArgs {
             desired_access: FileAccessMask::new().with_generic_all(true),
             requested_oplock_level: OplockLevel::None,
             requested_lease: None,
+            requested_durable: None,
             share_access: None,
         }
     }
@@ -95,6 +99,7 @@ impl FileCreateArgs {
                 .with_generic_write(true),
             requested_oplock_level: OplockLevel::None,
             requested_lease: None,
+            requested_durable: None,
             share_access: None,
         }
     }
@@ -106,6 +111,11 @@ impl FileCreateArgs {
 
     pub fn with_lease_request(mut self, lease: RequestLease) -> Self {
         self.requested_lease = Some(lease);
+        self
+    }
+
+    pub fn with_durable_handle_v2(mut self, request: DurableHandleRequestV2) -> Self {
+        self.requested_durable = Some(request);
         self
     }
 
@@ -162,6 +172,12 @@ impl Resource {
         if let Some(lease) = create_args.requested_lease.clone() {
             contexts.push(lease.into());
         }
+        if let Some(durable) = create_args.requested_durable.as_ref() {
+            contexts.push(
+                DurableHandleRequestV2::new(durable.timeout, durable.flags, durable.create_guid)
+                    .into(),
+            );
+        }
 
         let mut msg = OutgoingMessage::new(
             CreateRequest {
@@ -202,6 +218,11 @@ impl Resource {
 
         let granted_lease =
             CreateContextResponseData::first_rqls(&response.create_contexts).cloned();
+        let durable_handle =
+            CreateContextResponseData::first_dh2q(&response.create_contexts).map(|resp| DH2QResp {
+                timeout: resp.timeout,
+                flags: resp.flags,
+            });
 
         // Common information is held in the handle object.
         let handle = ResourceHandle {
@@ -216,6 +237,7 @@ impl Resource {
             conn_info: conn_info.clone(),
             granted_oplock_level: response.oplock_level,
             granted_lease,
+            durable_handle,
         };
 
         // Construct specific resource and return it.
@@ -313,6 +335,7 @@ pub struct ResourceHandle {
     conn_info: Arc<ConnectionInfo>,
     granted_oplock_level: OplockLevel,
     granted_lease: Option<RequestLease>,
+    durable_handle: Option<DH2QResp>,
 }
 
 #[maybe_async(AFIT)]
@@ -349,6 +372,10 @@ impl ResourceHandle {
 
     pub fn granted_lease(&self) -> Option<&RequestLease> {
         self.granted_lease.as_ref()
+    }
+
+    pub fn durable_handle(&self) -> Option<&DH2QResp> {
+        self.durable_handle.as_ref()
     }
 
     /// (Internal)

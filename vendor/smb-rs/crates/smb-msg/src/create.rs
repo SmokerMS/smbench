@@ -712,9 +712,18 @@ pub struct DurableHandleRequestV2 {
     pub timeout: u32,
     /// Flags indicating whether a persistent handle is requested
     pub flags: DurableHandleV2Flags,
-    reserved: u64,
     /// GUID that identifies the create request
     pub create_guid: Guid,
+}
+
+impl DurableHandleRequestV2 {
+    pub fn new(timeout: u32, flags: DurableHandleV2Flags, create_guid: Guid) -> Self {
+        Self {
+            timeout,
+            flags,
+            create_guid,
+        }
+    }
 }
 
 /// Flags for durable handle v2 requests.

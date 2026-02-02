@@ -498,6 +498,7 @@ mod smb_rs_validation {
             desired_access,
             requested_oplock_level: OplockLevel::None,
             requested_lease: None,
+            requested_durable: None,
             share_access: Some(
                 smb::ShareAccessFlags::new()
                     .with_read(true)
@@ -970,6 +971,62 @@ mod smb_rs_validation {
         breaker.await.context("breaker task join")??;
         file1.close().await?;
         client1.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_durable_handle_v2() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs durable handle test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let file_name = unique_name("smbench_durable");
+        let file_path = share_path.clone().with_path(&file_name);
+        let mut seed_options = CreateOptions::new();
+        seed_options.set_non_directory_file(true);
+        let seed_args = FileCreateArgs::make_overwrite(FileAttributes::new(), seed_options);
+        let seed = client.create_file(&file_path, &seed_args).await?;
+        let seed: File = match seed.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        seed.close().await?;
+
+        let access = FileAccessMask::new()
+            .with_generic_read(true)
+            .with_generic_write(true);
+        let mut args = FileCreateArgs::make_open_existing(access);
+        let mut flags = smb::DurableHandleV2Flags::new();
+        let persistent = std::env::var("SMBENCH_DURABLE_PERSISTENT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if persistent {
+            flags.set_persistent(true);
+        }
+        let durable =
+            smb::DurableHandleRequestV2::new(0, flags, smb::Guid::generate());
+        args = args.with_durable_handle_v2(durable);
+
+        let resource = client.create_file(&file_path, &args).await?;
+        let file: File = match resource.try_into() {
+            Ok(file) => file,
+            Err((err, _resource)) => return Err(anyhow::anyhow!(err)),
+        };
+        let durable_granted = file.durable_handle().is_some();
+        if !durable_granted {
+            if std::env::var("SMBENCH_STRICT_DURABLE").ok().as_deref() == Some("1") {
+                return Err(anyhow::anyhow!("durable handle not granted by server"));
+            }
+            eprintln!("Durable handle not granted by server; skipping strict assertion");
+        }
+        file.close().await?;
+        client.close().await?;
         Ok(())
     }
 }

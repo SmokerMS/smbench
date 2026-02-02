@@ -154,6 +154,7 @@ impl Tree {
                 attributes: FileAttributes::new(),
                 requested_oplock_level: OplockLevel::None,
                 requested_lease: None,
+                requested_durable: None,
                 share_access: None,
             },
         )
@@ -177,6 +178,7 @@ impl Tree {
                 attributes: FileAttributes::new().with_directory(true),
                 requested_oplock_level: OplockLevel::None,
                 requested_lease: None,
+                requested_durable: None,
                 share_access: None,
             },
         )

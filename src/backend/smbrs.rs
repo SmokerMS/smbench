@@ -338,6 +338,7 @@ fn build_args_from_extensions(
     let requested_oplock_level = parse_oplock_level(extensions).unwrap_or(smb::OplockLevel::None);
     let share_access = parse_share_access(extensions);
     let requested_lease = parse_lease_request(extensions);
+    let requested_durable = parse_durable_handle(extensions);
 
     smb::FileCreateArgs {
         disposition,
@@ -346,6 +347,7 @@ fn build_args_from_extensions(
         desired_access,
         requested_oplock_level,
         requested_lease,
+        requested_durable,
         share_access,
     }
 }
@@ -458,6 +460,28 @@ fn parse_lease_request(ext: &serde_json::Value) -> Option<smb::RequestLease> {
             lease_key, lease_state, flags, parent_key, epoch,
         )))
     }
+}
+
+fn parse_durable_handle(ext: &serde_json::Value) -> Option<smb::DurableHandleRequestV2> {
+    let value = ext.get("durable_handle")?;
+    let obj = if value.is_object() { value } else { &serde_json::json!({}) };
+    let timeout = obj
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let persistent = obj
+        .get("persistent")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut flags = smb::DurableHandleV2Flags::new();
+    if persistent {
+        flags.set_persistent(true);
+    }
+    Some(smb::DurableHandleRequestV2::new(
+        timeout,
+        flags,
+        smb::Guid::generate(),
+    ))
 }
 
 fn guid_to_u128(input: &str) -> Result<u128> {
@@ -824,7 +848,8 @@ mod tests {
             "create_disposition": "overwrite_if",
             "create_options": {"write_through": true, "non_directory_file": true},
             "file_attributes": {"readonly": true},
-            "lease_request": {"version": "v1", "read": true}
+            "lease_request": {"version": "v1", "read": true},
+            "durable_handle": {"timeout_ms": 1000}
         });
         let args = build_args_from_extensions(OpenMode::ReadWrite, &ext);
         assert_eq!(args.disposition, smb::CreateDisposition::OverwriteIf);
@@ -834,6 +859,17 @@ mod tests {
         assert!(args.desired_access.generic_read());
         assert!(args.desired_access.file_write_data());
         assert!(args.requested_lease.is_some());
+        assert!(args.requested_durable.is_some());
+    }
+
+    #[test]
+    fn test_parse_durable_handle() {
+        let ext = serde_json::json!({
+            "durable_handle": {"timeout_ms": 500, "persistent": true}
+        });
+        let durable = parse_durable_handle(&ext).unwrap();
+        assert_eq!(durable.timeout, 500);
+        assert!(durable.flags.persistent());
     }
 
     #[test]
