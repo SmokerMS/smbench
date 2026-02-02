@@ -19,6 +19,7 @@ tokio-test = "0.4"
 criterion = "0.5"
 smb-fscc = { path = "vendor/smb-rs/crates/smb-fscc" }
 smb-msg = { path = "vendor/smb-rs/crates/smb-msg" }
+futures-util = "0.3"
 
 [features]
 default = []

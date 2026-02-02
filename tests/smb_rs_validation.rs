@@ -7,6 +7,7 @@ mod smb_rs_validation {
     use anyhow::{Context, Result};
     use smbench::backend::smbrs::{SmbRsBackend, SmbRsConfig};
     use smbench::backend::SMBBackend;
+    use futures_util::StreamExt;
     use smb::{
         Client, ClientConfig, ConnectionConfig, CreateOptions, Dialect, Directory, File,
         FileAccessMask, FileAttributes, FileCreateArgs, GetLen, LeaseState, OplockLevel,
@@ -14,6 +15,8 @@ mod smb_rs_validation {
     };
     use smb::resource::file_util::SetLen;
     use smb_msg::NotifyFilter;
+    use smb_fscc::{DirAccessMask, FileDirectoryInformation};
+    use std::sync::Arc;
 
     fn smb_env() -> Option<(String, String, String, String)> {
         let server = env::var("SMBENCH_SMB_SERVER").ok()?;
@@ -1127,6 +1130,92 @@ mod smb_rs_validation {
                 tree.share_flags()?.encrypt_data(),
                 "expected share encryption flag to be set"
             );
+        }
+
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_query_directory() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs query directory test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let dir_name = unique_name("smbench_query_dir");
+        let dir_path = share_path.clone().with_path(&dir_name);
+        let create_dir_args = FileCreateArgs::make_create_new(
+            FileAttributes::new().with_directory(true),
+            CreateOptions::new().with_directory_file(true),
+        );
+        client
+            .create_file(&dir_path, &create_dir_args)
+            .await?
+            .unwrap_dir()
+            .close()
+            .await?;
+
+        let file_name = format!("{dir_name}\\query.txt");
+        let file_path = share_path.clone().with_path(&file_name);
+        let file_args = FileCreateArgs::make_create_new(
+            FileAttributes::new(),
+            CreateOptions::new().with_non_directory_file(true),
+        );
+        client
+            .create_file(&file_path, &file_args)
+            .await?
+            .unwrap_file()
+            .close()
+            .await?;
+
+        let directory = client
+            .create_file(
+                &dir_path,
+                &FileCreateArgs::make_open_existing(
+                    DirAccessMask::new().with_list_directory(true).into(),
+                ),
+            )
+            .await?
+            .unwrap_dir();
+        let directory = Arc::new(directory);
+
+        let mut found = false;
+        let stream = Directory::query::<FileDirectoryInformation>(&directory, "query.txt").await?;
+        stream
+            .for_each(|entry| {
+                if let Ok(entry) = entry {
+                    if entry.file_name.to_string() == "query.txt" {
+                        found = true;
+                    }
+                }
+                async {}
+            })
+            .await;
+
+        assert!(found, "query directory did not return expected file");
+        directory.close().await?;
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(file) = client.create_file(&file_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
+        }
+        if let Ok(dir) = client.create_file(&dir_path, &cleanup_open).await {
+            let dir = dir.unwrap_dir();
+            let _ = dir
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = dir.close().await;
         }
 
         client.close().await?;
