@@ -15,7 +15,9 @@ mod smb_rs_validation {
     };
     use smb::resource::file_util::SetLen;
     use smb_msg::NotifyFilter;
-    use smb_fscc::{DirAccessMask, FileDirectoryInformation};
+    use smb_fscc::{
+        DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileStandardInformation,
+    };
     use std::sync::Arc;
 
     fn smb_env() -> Option<(String, String, String, String)> {
@@ -1216,6 +1218,67 @@ mod smb_rs_validation {
                 .set_info(smb::FileDispositionInformation::default())
                 .await;
             let _ = dir.close().await;
+        }
+
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_query_file_info() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs query file info test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let file_name = unique_name("smbench_query_info");
+        let file_path = share_path.clone().with_path(&file_name);
+        let create_args = FileCreateArgs::make_overwrite(
+            FileAttributes::new(),
+            CreateOptions::new().with_non_directory_file(true),
+        );
+        let file = client
+            .create_file(&file_path, &create_args)
+            .await?
+            .unwrap_file();
+
+        let data = b"query-info";
+        file.write_block(data, 0, None).await?;
+        file.set_len(data.len() as u64).await?;
+        file.flush().await?;
+
+        let basic: FileBasicInformation = file.query_info().await?;
+        assert!(
+            !basic.file_attributes.directory(),
+            "expected non-directory attributes"
+        );
+
+        let standard: FileStandardInformation = file.query_info().await?;
+        assert!(
+            standard.end_of_file >= data.len() as u64,
+            "end_of_file too small: {}",
+            standard.end_of_file
+        );
+        assert!(
+            !bool::from(standard.directory),
+            "expected non-directory standard info"
+        );
+
+        file.close().await?;
+
+        let cleanup_open = FileCreateArgs::make_open_existing(
+            FileAccessMask::new().with_generic_all(true),
+        );
+        if let Ok(file) = client.create_file(&file_path, &cleanup_open).await {
+            let file = file.unwrap_file();
+            let _ = file
+                .set_info(smb::FileDispositionInformation::default())
+                .await;
+            let _ = file.close().await;
         }
 
         client.close().await?;
