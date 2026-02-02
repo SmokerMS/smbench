@@ -239,6 +239,49 @@ impl MessageHandler for ChannelMessageHandler {
         Ok(incoming)
     }
 
+    async fn send_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+        related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        {
+            let session = self.session_state.read().await?;
+            let session = session.session.read().await?;
+            if session.is_invalid() {
+                return Err(Error::InvalidState("Session is invalid".to_string()));
+            }
+
+            for msg in msgs.iter_mut() {
+                // It is possible for a lower level to request encryption.
+                if msg.encrypt {
+                    // Session must be ready to encrypt messages.
+                    if !session.is_ready() {
+                        return Err(Error::InvalidState(
+                            "Session is not ready, cannot encrypt message".to_string(),
+                        ));
+                    }
+                }
+                // Otherwise, we should check the session's configuration.
+                else if session.is_ready() || session.is_setting_up() {
+                    // Encrypt if configured for the session,
+                    if session.is_ready() && session.should_encrypt()? {
+                        msg.encrypt = true;
+                    }
+                    // Sign
+                    else if !session.allow_unsigned()? {
+                        msg.message.header.flags.set_signed(true);
+                    }
+                }
+            }
+        }
+
+        for msg in msgs.iter_mut() {
+            msg.message.header.session_id = self.session_id;
+        }
+
+        self.upstream.send_compound(msgs, related).await
+    }
+
     async fn notify(&self, msg: IncomingMessage) -> crate::Result<()> {
         self._verify_incoming(&msg).await?;
 

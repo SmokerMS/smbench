@@ -4,7 +4,7 @@ use crate::{
     Error, connection::connection_info::ConnectionInfo, msg_handler::ReceiveOptions,
     session::SessionAndChannel, sync_helpers::*,
 };
-use smb_transport::SmbTransport;
+use smb_transport::{IoVec, SmbTransport};
 
 use maybe_async::*;
 use smb_msg::Status;
@@ -29,6 +29,7 @@ pub trait Worker: Sized + std::fmt::Debug {
     async fn stop(&self) -> crate::Result<()>;
 
     async fn send(&self, msg: OutgoingMessage) -> crate::Result<SendMessageResult>;
+    async fn send_raw(&self, msg: IoVec) -> crate::Result<()>;
 
     /// (Internal)
     ///

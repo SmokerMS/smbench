@@ -151,6 +151,16 @@ impl Connection {
         Ok(())
     }
 
+    /// Sends a compounded SMB2 request chain and returns the responses.
+    pub async fn send_compound(
+        &self,
+        messages: Vec<RequestContent>,
+        related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        let msgs = messages.into_iter().map(OutgoingMessage::new).collect();
+        self.handler.send_compound(msgs, related).await
+    }
+
     /// Starts a new connection from an existing, connected transport.
     ///
     /// This is especially useful when you want to use a custom transport - otherwise,
@@ -878,6 +888,71 @@ impl MessageHandler for ConnectionMessageHandler {
             .ok_or(Error::InvalidState("Worker is uninitialized".into()))?
             .send(msg)
             .await
+    }
+
+    #[maybe_async]
+    async fn send_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+        related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        if msgs.is_empty() {
+            return Err(Error::InvalidArgument(
+                "Compound message list is empty".to_string(),
+            ));
+        }
+
+        let priority_value = match self.conn_info.get() {
+            Some(neg_info) => match neg_info.negotiation.dialect_rev {
+                Dialect::Smb0311 => 1,
+                _ => 0,
+            },
+            None => 0,
+        };
+
+        let mut response_filters = Vec::new();
+        for (idx, msg) in msgs.iter_mut().enumerate() {
+            msg.message.header.flags = msg.message.header.flags.with_priority_mask(priority_value);
+            if related && idx > 0 {
+                msg.message.header.flags.set_related_operations(true);
+            }
+
+            let is_cancel = msg.message.content.as_cancel().is_ok();
+            if !is_cancel {
+                self.process_sequence_outgoing(msg).await?;
+            } else if msg.message.header.message_id == 0 {
+                return Err(Error::InvalidState(
+                    "Cancel message must have a valid message ID".into(),
+                ));
+            }
+
+            if msg.has_response {
+                response_filters.push((
+                    msg.message.header.message_id,
+                    msg.message.content.associated_cmd(),
+                ));
+            }
+        }
+
+        let worker = self
+            .worker
+            .get()
+            .ok_or(Error::InvalidState("Worker is uninitialized".into()))?;
+        let raw = worker
+            .transformer()
+            .transform_outgoing_compound(msgs)
+            .await?;
+        worker.send_raw(raw).await?;
+
+        let mut responses = Vec::with_capacity(response_filters.len());
+        for (msg_id, cmd) in response_filters {
+            let response = self
+                .recvo(ReceiveOptions::new().with_cmd(Some(cmd)).with_msg_id_filter(msg_id))
+                .await?;
+            responses.push(response);
+        }
+
+        Ok(responses)
     }
 
     #[maybe_async]

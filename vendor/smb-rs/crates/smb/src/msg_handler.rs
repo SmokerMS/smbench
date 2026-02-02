@@ -7,6 +7,8 @@ use std::sync::{Arc, atomic::AtomicU64};
 #[cfg(feature = "async")]
 use tokio_util::sync::CancellationToken;
 
+use crate::Error;
+
 #[derive(Debug)]
 pub struct OutgoingMessage {
     pub message: PlainRequest,
@@ -274,6 +276,15 @@ pub trait MessageHandler {
     /// This must be implemented, and must call the next handler in the chain,
     /// if there is one, using the provided `ReceiveOptions`.
     async fn recvo(&self, options: ReceiveOptions) -> crate::Result<IncomingMessage>;
+
+    /// Send a compounded SMB2 message chain and receive responses.
+    async fn send_compound(
+        &self,
+        _msgs: Vec<OutgoingMessage>,
+        _related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        Err(Error::InvalidState("Compound not supported by handler".to_string()))
+    }
 
     /// Called when a server-to-client message is received.
     ///

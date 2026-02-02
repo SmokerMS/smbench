@@ -101,16 +101,19 @@ where
         let message = message?;
 
         // Tranform the message and verify it.
-        let msg = self.transformer.transform_incoming(message).await;
-        let (msg, msg_id) = match msg {
-            // Good flow, message is OK.
-            Ok(msg) => {
-                let msg_id = msg.message.header.message_id;
-                (Ok(msg), msg_id)
-            }
+        let messages = self.transformer.transform_incoming(message).await;
+        let messages = match messages {
+            Ok(messages) => messages,
             // If we have a message ID to notify the error, use it.
             Err(crate::Error::TranformFailed(e)) => match e.msg_id {
-                Some(msg_id) => (Err(crate::Error::TranformFailed(e)), msg_id),
+                Some(msg_id) => {
+                    let mut state = self.state.lock().await?;
+                    if let Some(tx) = state.awaiting.remove(&msg_id) {
+                        T::send_notify(tx, Err(crate::Error::TranformFailed(e)))?;
+                        return Ok(());
+                    }
+                    return Err(Error::TranformFailed(e));
+                }
                 None => {
                     if std::env::var("SMBENCH_DEBUG_SMB").ok().as_deref() == Some("1") {
                         eprintln!(
@@ -130,8 +133,8 @@ where
             }
         };
 
-        // Handle server-to-client notifications (oplocks/leases/notify), even if message_id isn't -1.
-        if let Ok(msg) = msg {
+        for msg in messages {
+            // Handle server-to-client notifications (oplocks/leases/notify), even if message_id isn't -1.
             if matches!(
                 msg.message.content,
                 ResponseContent::OplockBreakNotify(_)
@@ -160,39 +163,21 @@ where
                     }
                     log::warn!("Received notification message, but no notify channel is set.");
                 }
-                return Ok(());
+                continue;
             }
 
-            // Re-wrap for normal processing below.
-            let msg_id = msg_id;
-            let msg = Ok(msg);
-            // fallthrough
+            let msg_id = msg.message.header.message_id;
             let mut state = self.state.lock().await?;
             let message_waiter = state.awaiting.remove(&msg_id);
             match message_waiter {
                 Some(tx) => {
                     log::trace!("Waking up awaiting task for key {msg_id}.");
-                    T::send_notify(tx, msg)?;
+                    T::send_notify(tx, Ok(msg))?;
                 }
                 None => {
                     log::trace!("Storing message until awaited: {msg_id}.",);
-                    state.pending.insert(msg_id, msg);
+                    state.pending.insert(msg_id, Ok(msg));
                 }
-            }
-            return Ok(());
-        }
-
-        // Update the state: If awaited, wake up the task. Else, store it.
-        let mut state = self.state.lock().await?;
-        let message_waiter = state.awaiting.remove(&msg_id);
-        match message_waiter {
-            Some(tx) => {
-                log::trace!("Waking up awaiting task for key {msg_id}.");
-                T::send_notify(tx, msg)?;
-            }
-            None => {
-                log::trace!("Storing message until awaited: {msg_id}.",);
-                state.pending.insert(msg_id, msg);
             }
         }
         Ok(())
@@ -303,6 +288,13 @@ where
         })?;
 
         Ok(SendMessageResult::new(id, raw_message_copy))
+    }
+
+    async fn send_raw(&self, msg: IoVec) -> crate::Result<()> {
+        self.sender.send(T::wrap_msg_to_send(msg)).await.map_err(|_| {
+            Error::MessageProcessingError("Failed to send raw message to worker!".to_string())
+        })?;
+        Ok(())
     }
 
     async fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {

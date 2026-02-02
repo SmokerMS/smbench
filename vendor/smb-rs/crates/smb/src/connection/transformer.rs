@@ -260,83 +260,247 @@ impl Transformer {
         Ok(outgoing_data)
     }
 
-    /// Transforms an incoming message buffer to an [`IncomingMessage`].
-    pub async fn transform_incoming(&self, data: Vec<u8>) -> crate::Result<IncomingMessage> {
-        let message = Response::try_from(data.as_ref())?;
+    /// Transforms multiple outgoing messages to a single compounded SMB message buffer.
+    pub async fn transform_outgoing_compound(
+        &self,
+        mut msgs: Vec<OutgoingMessage>,
+    ) -> crate::Result<IoVec> {
+        if msgs.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "Compound message list is empty".to_string(),
+            ));
+        }
 
-        let mut form = MessageForm::default();
+        let should_encrypt = msgs[0].encrypt;
+        let should_compress = msgs[0].compress;
+        for msg in &msgs {
+            if msg.encrypt != should_encrypt || msg.compress != should_compress {
+                return Err(crate::Error::InvalidArgument(
+                    "Compound messages must share encrypt/compress settings".to_string(),
+                ));
+            }
+        }
 
-        // 3. Decrpt
-        let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
-            let session_id = encrypted_message.header.session_id;
+        let session_id = msgs[0].message.header.session_id;
+        let mut message_sizes = Vec::with_capacity(msgs.len());
 
-            let mut decryptor = self
-                ._with_session(session_id, |session| {
-                    let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
-                        TransformError {
-                            outgoing: false,
-                            phase: TransformPhase::EncryptDecrypt,
-                            session_id: Some(session_id),
-                            why: "Message is required to be encrypted, but no decryptor is set up!",
-                            msg_id: None,
-                        },
-                    ))?;
-                    Ok(decryptor.clone())
-                })
-                .await?;
-            form.encrypted = true;
-            decryptor.decrypt_message(encrypted_message)?
-        } else {
-            (message, data)
-        };
+        for msg in msgs.iter_mut() {
+            msg.message.header.next_command = 0;
+            let raw = Self::serialize_plain_request(&msg.message, msg.additional_data.as_deref())?;
+            message_sizes.push(raw.len());
+        }
 
-        // 2. Decompress
-        debug_assert!(!matches!(message, Response::Encrypted(_)));
-        let (message, raw) = if let Response::Compressed(compressed_message) = message {
-            let rconfig = self.config.read().await?;
-            form.compressed = true;
-            match &rconfig.compress {
-                Some(compress) => compress.1.decompress(&compressed_message)?,
-                None => {
-                    return Err(crate::Error::TranformFailed(TransformError {
-                        outgoing: false,
-                        phase: TransformPhase::CompressDecompress,
-                        session_id: None,
-                        why: "Compression is requested, but no decompressor is set up!",
-                        msg_id: None,
-                    }));
+        let mut offsets = Vec::with_capacity(msgs.len());
+        let mut total_len = 0usize;
+        for (idx, size) in message_sizes.iter().enumerate() {
+            offsets.push(total_len);
+            let padded = if idx + 1 == message_sizes.len() {
+                *size
+            } else {
+                Self::align8(*size)
+            };
+            total_len += padded;
+        }
+
+        let msg_count = msgs.len();
+        let mut compound = Vec::with_capacity(total_len);
+        for (idx, msg) in msgs.iter_mut().enumerate() {
+            let is_last = idx + 1 == msg_count;
+            let next_command = if is_last {
+                0
+            } else {
+                Self::align8(message_sizes[idx]) as u32
+            };
+            msg.message.header.next_command = next_command;
+
+            let raw = Self::serialize_plain_request(&msg.message, msg.additional_data.as_deref())?;
+            let raw_len = raw.len();
+            compound.extend_from_slice(&raw);
+
+            if !is_last {
+                let padded = Self::align8(raw_len);
+                if padded > raw_len {
+                    compound.resize(compound.len() + (padded - raw_len), 0);
                 }
             }
-        } else {
-            (message, raw)
-        };
+        }
 
-        let mut message = match message {
-            Response::Plain(message) => message,
-            _ => panic!("Unexpected message type"),
-        };
+        if msgs[0].message.header.flags.signed() {
+            debug_assert!(
+                !should_encrypt,
+                "Should not sign and encrypt at the same time!"
+            );
 
-        let iovec = IoVec::from(raw);
-        // If fails, return TranformFailed, with message id.
-        // this allows to notify the error to the task that was waiting for this message.
-        match self
-            .verify_plain_incoming(&mut message, &iovec, &mut form)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to verify incoming message: {e:?}",);
-                return Err(crate::Error::TranformFailed(TransformError {
-                    outgoing: false,
-                    phase: TransformPhase::SignVerify,
-                    session_id: Some(message.header.session_id),
-                    why: "Failed to verify incoming message!",
-                    msg_id: Some(message.header.message_id),
-                }));
+            let mut signer = self
+                ._with_channel(session_id, |session| {
+                    let channel_info =
+                        session
+                            .channel
+                            .as_ref()
+                            .ok_or(crate::Error::TranformFailed(TransformError {
+                                outgoing: true,
+                                phase: TransformPhase::SignVerify,
+                                session_id: Some(session_id),
+                                why: "Message is required to be signed, but no channel is set up!",
+                                msg_id: Some(msgs[0].message.header.message_id),
+                            }))?;
+
+                    Ok(channel_info.signer()?.clone())
+                })
+                .await?;
+
+            for (idx, msg) in msgs.iter_mut().enumerate() {
+                let start = offsets[idx];
+                let len = if idx + 1 == msg_count {
+                    message_sizes[idx]
+                } else {
+                    Self::align8(message_sizes[idx])
+                };
+                let mut iovec = IoVec::from(compound[start..start + len].to_vec());
+                signer.sign_message(&mut msg.message.header, &mut iovec)?;
+
+                let mut header_writer =
+                    Cursor::new(&mut compound[start..start + Header::STRUCT_SIZE]);
+                msg.message.header.write(&mut header_writer)?;
+            }
+        }
+
+        let mut outgoing_data = IoVec::from(compound);
+        const COMPRESSION_THRESHOLD: usize = 1024;
+        if should_compress && outgoing_data.total_size() > COMPRESSION_THRESHOLD {
+            let rconfig = self.config.read().await?;
+            if let Some(compress) = &rconfig.compress {
+                outgoing_data.consolidate();
+                let compressed = compress.0.compress(outgoing_data.first().unwrap())?;
+
+                let mut compressed_result = IoVec::default();
+                let write_compressed =
+                    compressed_result.add_owned(Vec::with_capacity(compressed.total_size()));
+                compressed.write(&mut Cursor::new(write_compressed))?;
+                outgoing_data = compressed_result;
+            }
+        }
+
+        if should_encrypt {
+            let mut encryptor = self
+                ._with_session(session_id, |session| {
+                    let encryptor = session.encryptor()?.ok_or(crate::Error::TranformFailed(
+                        TransformError {
+                            outgoing: true,
+                            phase: TransformPhase::EncryptDecrypt,
+                            session_id: Some(session_id),
+                            why: "Message is required to be encrypted, but no encryptor is set up!",
+                            msg_id: Some(msgs[0].message.header.message_id),
+                        },
+                    ))?;
+                    Ok(encryptor.clone())
+                })
+                .await?;
+
+            let encrypted_header = encryptor.encrypt_message(&mut outgoing_data, session_id)?;
+            let write_encryption_header =
+                outgoing_data.insert_owned(0, Vec::with_capacity(EncryptedHeader::STRUCTURE_SIZE));
+            encrypted_header.write(&mut Cursor::new(write_encryption_header))?;
+        }
+
+        Ok(outgoing_data)
+    }
+
+    /// Transforms an incoming message buffer to one or more [`IncomingMessage`] instances.
+    pub async fn transform_incoming(&self, data: Vec<u8>) -> crate::Result<Vec<IncomingMessage>> {
+        let parsed = Response::try_from(data.as_ref());
+        let (raw, form) = match parsed {
+            Ok(message) => {
+                let mut form = MessageForm::default();
+
+                // 3. Decrypt
+                let (message, raw) = if let Response::Encrypted(encrypted_message) = message {
+                    let session_id = encrypted_message.header.session_id;
+
+                    let mut decryptor = self
+                        ._with_session(session_id, |session| {
+                            let decryptor = session.decryptor()?.ok_or(crate::Error::TranformFailed(
+                                TransformError {
+                                    outgoing: false,
+                                    phase: TransformPhase::EncryptDecrypt,
+                                    session_id: Some(session_id),
+                                    why: "Message is required to be encrypted, but no decryptor is set up!",
+                                    msg_id: None,
+                                },
+                            ))?;
+                            Ok(decryptor.clone())
+                        })
+                        .await?;
+                    form.encrypted = true;
+                    decryptor.decrypt_message(encrypted_message)?
+                } else {
+                    (message, data)
+                };
+
+                // 2. Decompress
+                debug_assert!(!matches!(message, Response::Encrypted(_)));
+                let (_message, raw) = if let Response::Compressed(compressed_message) = message {
+                    let rconfig = self.config.read().await?;
+                    form.compressed = true;
+                    match &rconfig.compress {
+                        Some(compress) => compress.1.decompress(&compressed_message)?,
+                        None => {
+                            return Err(crate::Error::TranformFailed(TransformError {
+                                outgoing: false,
+                                phase: TransformPhase::CompressDecompress,
+                                session_id: None,
+                                why: "Compression is requested, but no decompressor is set up!",
+                                msg_id: None,
+                            }));
+                        }
+                    }
+                } else {
+                    (message, raw)
+                };
+
+                (raw, form)
+            }
+            Err(err) => {
+                if data.len() >= 4 && data[0..4] == [0xFE, b'S', b'M', b'B'] {
+                    (data, MessageForm::default())
+                } else {
+                    return Err(err.into());
+                }
             }
         };
 
-        Ok(IncomingMessage::new(message, iovec, form))
+        let mut responses = Vec::new();
+        for (mut message, raw_msg) in self.split_plain_responses(&raw)? {
+            let iovec = IoVec::from(raw_msg);
+            let mut msg_form = MessageForm {
+                compressed: form.compressed,
+                encrypted: form.encrypted,
+                signed: false,
+            };
+
+            // If fails, return TranformFailed, with message id.
+            // this allows to notify the error to the task that was waiting for this message.
+            match self
+                .verify_plain_incoming(&mut message, &iovec, &mut msg_form)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Failed to verify incoming message: {e:?}",);
+                    return Err(crate::Error::TranformFailed(TransformError {
+                        outgoing: false,
+                        phase: TransformPhase::SignVerify,
+                        session_id: Some(message.header.session_id),
+                        why: "Failed to verify incoming message!",
+                        msg_id: Some(message.header.message_id),
+                    }));
+                }
+            };
+
+            responses.push(IncomingMessage::new(message, iovec, msg_form));
+        }
+
+        Ok(responses)
     }
 
     /// (Internal)
@@ -387,6 +551,71 @@ impl Transformer {
         );
         form.signed = true;
         Ok(())
+    }
+
+    fn align8(size: usize) -> usize {
+        (size + 7) & !7
+    }
+
+    fn serialize_plain_request(
+        msg: &PlainRequest,
+        additional_data: Option<&[u8]>,
+    ) -> crate::Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(Header::STRUCT_SIZE);
+        msg.write(&mut Cursor::new(&mut buffer))?;
+        if let Some(data) = additional_data {
+            buffer.extend_from_slice(data);
+        }
+        Ok(buffer)
+    }
+
+    fn split_plain_responses(
+        &self,
+        raw: &[u8],
+    ) -> crate::Result<Vec<(PlainResponse, Vec<u8>)>> {
+        let mut offset = 0usize;
+        let mut responses = Vec::new();
+
+        while offset < raw.len() {
+            if raw.len() - offset < Header::STRUCT_SIZE {
+                return Err(crate::Error::InvalidMessage(
+                    "Compound response too short".to_string(),
+                ));
+            }
+
+            let mut header_cursor = Cursor::new(&raw[offset..]);
+            let header = Header::read(&mut header_cursor)?;
+            let next = header.next_command as usize;
+            let msg_len = if next == 0 { raw.len() - offset } else { next };
+
+            if msg_len < Header::STRUCT_SIZE || offset + msg_len > raw.len() {
+                return Err(crate::Error::InvalidMessage(
+                    "Compound response length is invalid".to_string(),
+                ));
+            }
+
+            let mut msg_cursor = Cursor::new(&raw[offset..offset + msg_len]);
+            let message = PlainResponse::read(&mut msg_cursor)?;
+            responses.push((message, raw[offset..offset + msg_len].to_vec()));
+
+            if next == 0 {
+                break;
+            }
+            if msg_len % 8 != 0 {
+                return Err(crate::Error::InvalidMessage(
+                    "Compound response is not 8-byte aligned".to_string(),
+                ));
+            }
+            offset += msg_len;
+        }
+
+        if offset < raw.len() {
+            return Err(crate::Error::InvalidMessage(
+                "Compound response contains trailing bytes".to_string(),
+            ));
+        }
+
+        Ok(responses)
     }
 
     /// (Internal)

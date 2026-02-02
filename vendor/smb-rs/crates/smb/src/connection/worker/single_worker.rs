@@ -3,7 +3,7 @@ use crate::{
     error::*,
     msg_handler::{IncomingMessage, OutgoingMessage, ReceiveOptions, SendMessageResult},
 };
-use smb_transport::{SmbTransport, TransportError};
+use smb_transport::{IoVec, SmbTransport, TransportError};
 use std::sync::OnceLock;
 use std::{
     sync::{Arc, Mutex},
@@ -60,6 +60,14 @@ impl Worker for SingleWorker {
         Ok(SendMessageResult::new(msg_id, raw_msg))
     }
 
+    fn send_raw(&self, msg: IoVec) -> crate::Result<()> {
+        let mut t = self.transport.lock()?;
+        t.get_mut()
+            .ok_or(crate::Error::ConnectionStopped)?
+            .send(&msg)?;
+        Ok(())
+    }
+
     fn receive_next(&self, options: &ReceiveOptions<'_>) -> crate::Result<IncomingMessage> {
         // Receive next message
         let mut self_mut = self.transport.lock()?;
@@ -86,8 +94,15 @@ impl Worker for SingleWorker {
             }
             _ => e.into(),
         })?;
-        // Transform the message
-        let im = self.transformer.transform_incoming(msg)?;
+        // Transform the message(s)
+        let mut ims = self.transformer.transform_incoming(msg)?;
+        let im = if ims.len() == 1 {
+            ims.remove(0)
+        } else {
+            ims.into_iter()
+                .find(|im| im.message.header.message_id == options.msg_id)
+                .ok_or_else(|| crate::Error::UnexpectedMessageId(0, options.msg_id))?
+        };
         // Make sure this is our message.
         // In async clients, this is no issue, but here, we can't deal with unordered/unexpected message IDs.
         if im.message.header.message_id != options.msg_id {

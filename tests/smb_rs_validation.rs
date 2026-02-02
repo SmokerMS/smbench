@@ -14,7 +14,7 @@ mod smb_rs_validation {
         RequestLease, RequestLeaseV1, RequestLeaseV2, UncPath,
     };
     use smb::resource::file_util::{SetLen, block_copy};
-    use smb_msg::NotifyFilter;
+    use smb_msg::{EchoRequest, NotifyFilter, RequestContent};
     use smb_fscc::{
         DirAccessMask, FileBasicInformation, FileDirectoryInformation, FileFsAttributeInformation,
         FileFsSizeInformation, FileStandardInformation,
@@ -1471,6 +1471,37 @@ mod smb_rs_validation {
                 .set_info(smb::FileDispositionInformation::default())
                 .await;
             let _ = file.close().await;
+        }
+
+        client.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_smb_rs_compound_echo() -> Result<()> {
+        let Some((server, share, user, pass)) = smb_env() else {
+            eprintln!("SMB env not set; skipping smb-rs compound echo test");
+            return Ok(());
+        };
+
+        let client = Client::new(ClientConfig::default());
+        let share_path = UncPath::from_str(&format!(r"\\{}\{}", server, share))?;
+        client.share_connect(&share_path, &user, pass).await?;
+
+        let tree = client.get_tree(&share_path).await?;
+        let responses = tree
+            .send_compound(
+                vec![
+                    RequestContent::Echo(EchoRequest::default()),
+                    RequestContent::Echo(EchoRequest::default()),
+                ],
+                false,
+            )
+            .await?;
+
+        assert_eq!(responses.len(), 2);
+        for response in responses {
+            response.message.content.as_echo()?;
         }
 
         client.close().await?;

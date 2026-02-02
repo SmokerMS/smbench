@@ -15,12 +15,11 @@ use smb_msg::{
 
 use crate::{
     Error, Resource,
-    msg_handler::{HandlerReference, MessageHandler},
+    msg_handler::{HandlerReference, IncomingMessage, MessageHandler, OutgoingMessage},
     session::SessionMessageHandler,
 };
 mod dfs_tree;
 mod ipc_tree;
-use crate::msg_handler::OutgoingMessage;
 pub use dfs_tree::*;
 pub use ipc_tree::*;
 
@@ -110,6 +109,17 @@ impl Tree {
         };
 
         Ok(t)
+    }
+
+    /// Sends a compounded SMB2 request chain on this tree and returns the responses.
+    #[maybe_async]
+    pub async fn send_compound(
+        &self,
+        messages: Vec<RequestContent>,
+        related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        let msgs = messages.into_iter().map(OutgoingMessage::new).collect();
+        self.handler.send_compound(msgs, related).await
     }
 
     /// Creates a resource (file, directory, pipe, or printer) on the remote server by it's name.
@@ -337,6 +347,24 @@ impl MessageHandler for TreeMessageHandler {
         }
 
         self.upstream.sendo(msg).await
+    }
+
+    #[maybe_async]
+    async fn send_compound(
+        &self,
+        mut msgs: Vec<crate::msg_handler::OutgoingMessage>,
+        related: bool,
+    ) -> crate::Result<Vec<crate::msg_handler::IncomingMessage>> {
+        for msg in msgs.iter_mut() {
+            if !msg.message.header.flags.async_command() {
+                msg.message.header.tree_id = self.tree_id.load(Ordering::SeqCst).into();
+                if self.info.share_flags.encrypt_data() {
+                    msg.encrypt = true;
+                }
+            }
+        }
+
+        self.upstream.send_compound(msgs, related).await
     }
 
     #[maybe_async]

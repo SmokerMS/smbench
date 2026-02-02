@@ -327,6 +327,26 @@ impl MessageHandler for SessionMessageHandler {
         self._with_channel(options.channel_id, RecvoWithChannel(options))
             .await
     }
+
+    async fn send_compound(
+        &self,
+        msgs: Vec<OutgoingMessage>,
+        related: bool,
+    ) -> crate::Result<Vec<IncomingMessage>> {
+        if msgs.is_empty() {
+            return Err(Error::InvalidArgument(
+                "Compound message list is empty".to_string(),
+            ));
+        }
+        let channel_id = msgs[0].channel_id;
+        if msgs.iter().any(|m| m.channel_id != channel_id) {
+            return Err(Error::InvalidArgument(
+                "Compound messages must use the same channel id".to_string(),
+            ));
+        }
+        self._with_channel(channel_id, SendCompoundWithChannel { msgs, related })
+            .await
+    }
 }
 
 #[maybe_async(AFIT)]
@@ -359,6 +379,22 @@ impl WithChannel for RecvoWithChannel<'_> {
         href: &HandlerReference<ChannelMessageHandler>,
     ) -> crate::Result<Self::Result> {
         href.recvo(self.0).await
+    }
+}
+
+struct SendCompoundWithChannel {
+    msgs: Vec<OutgoingMessage>,
+    related: bool,
+}
+
+#[maybe_async(AFIT)]
+impl WithChannel for SendCompoundWithChannel {
+    type Result = Vec<IncomingMessage>;
+    async fn work(
+        self,
+        href: &HandlerReference<ChannelMessageHandler>,
+    ) -> crate::Result<Self::Result> {
+        href.send_compound(self.msgs, self.related).await
     }
 }
 
