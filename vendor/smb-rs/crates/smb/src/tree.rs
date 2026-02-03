@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use maybe_async::*;
-use smb_msg::{FileId, FsctlRequest, IoctlRequest, IoctlRequestFlags};
+use smb_msg::{FileId, FsctlRequest};
 
 use crate::{FileCreateArgs, OplockLevel};
 use crate::connection::connection_info::ConnectionInfo;
