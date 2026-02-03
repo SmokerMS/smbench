@@ -1079,7 +1079,20 @@ mod tests {
         } => "000400000001e72a 00000000b017cfd9 00000000000000000000000000000000"
     }
 
-    // TODO(TEST): RqLsV1
+    /// Test RequestLeaseV1 (SMB2_CREATE_REQUEST_LEASE)
+    /// Reference: [MS-SMB2 2.2.13.2.8] SMB2_CREATE_REQUEST_LEASE
+    test_binrw_request! {
+        RequestLease => rqlsv1: RequestLease::RqLsReqv1(RequestLeaseV1 {
+            lease_key: guid!("a1b2c3d4-e5f6-7890-abcd-ef1234567890").as_u128(),
+            lease_state: LeaseState::new()
+                .with_read_caching(true)
+                .with_write_caching(true)
+                .with_handle_caching(true),
+        }) => "d4c3b2a1f6e59078abcdef123456789007000000"
+    }
+
+    /// Test RequestLeaseV2 (SMB2_CREATE_REQUEST_LEASE_V2)
+    /// Reference: [MS-SMB2 2.2.13.2.10] SMB2_CREATE_REQUEST_LEASE_V2
     test_binrw_request! {
         RequestLease => rqlsv2: RequestLease::RqLsReqv2(RequestLeaseV2 {
             lease_key: guid!("b69d8fd8-184b-7c4d-a359-40c8a53cd2b7").as_u128(),
