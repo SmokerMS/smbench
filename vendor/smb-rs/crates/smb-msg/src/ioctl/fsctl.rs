@@ -374,12 +374,299 @@ pub struct SrvHashRetrieveHashBased {
     buffer_length: u32,
     reserved: u32,
     /// A variable-length buffer that contains the retrieved portion of the Content Information File.
-    /// TODO: Parse as Content Information File as specified in MS-PCCRC section 2.3.
+    /// Parse using ContentInformation per MS-PCCRC 2.3.
     #[br(count = buffer_length)]
     blob: Vec<u8>,
 }
 
 impl_fsctl_response!(SrvReadHash, SrvHashRetrieveHashBased);
+
+/// Parsed Content Information payload from SRV_READ_HASH responses.
+///
+/// References:
+/// - MS-PCCRC 2.3 (Content Information v1.0)
+/// - MS-PCCRC 2.4 (Content Information v2.0)
+/// - https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pccrc/51cb03f8-c0dd-4565-9882-aeb5ab0fa07e
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentInformation {
+    V1(ContentInformationV1),
+    V2(ContentInformationV2),
+}
+
+impl ContentInformation {
+    pub fn parse(data: &[u8]) -> crate::Result<Self> {
+        if data.len() < 2 {
+            return Err(crate::SmbMsgError::InvalidData(
+                "Content Information buffer too small".to_string(),
+            ));
+        }
+        let version = u16::from_le_bytes([data[0], data[1]]);
+        if version == 0x0100 {
+            return ContentInformationV1::parse(data).map(ContentInformation::V1);
+        }
+        // Content Information v2.0 uses two one-byte version fields in big-endian order.
+        if data.len() >= 2 && data[0] == 0x00 && data[1] == 0x02 {
+            return ContentInformationV2::parse(data).map(ContentInformation::V2);
+        }
+        Err(crate::SmbMsgError::InvalidData(format!(
+            "Unsupported Content Information version: 0x{version:04x}"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInformationV1 {
+    pub hash_algo: PccrcHashAlgoV1,
+    pub offset_in_first_segment: u32,
+    pub read_bytes_in_last_segment: u32,
+    pub segments: Vec<ContentInfoV1Segment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInfoV1Segment {
+    pub offset_in_content: u64,
+    pub segment_length: u32,
+    pub block_size: u32,
+    pub segment_hash_of_data: Vec<u8>,
+    pub segment_secret: Vec<u8>,
+    pub block_hashes: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PccrcHashAlgoV1 {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl PccrcHashAlgoV1 {
+    fn hash_len(self) -> usize {
+        match self {
+            PccrcHashAlgoV1::Sha256 => 32,
+            PccrcHashAlgoV1::Sha384 => 48,
+            PccrcHashAlgoV1::Sha512 => 64,
+        }
+    }
+}
+
+impl ContentInformationV1 {
+    /// Parses Content Information v1.0 (little-endian).
+    /// See MS-PCCRC 2.3 and 2.3.1.
+    pub fn parse(data: &[u8]) -> crate::Result<Self> {
+        let mut offset = 0usize;
+        let version = read_u16_le(data, &mut offset)?;
+        if version != 0x0100 {
+            return Err(crate::SmbMsgError::InvalidData(format!(
+                "Unexpected v1 version: 0x{version:04x}"
+            )));
+        }
+        let hash_algo = match read_u32_le(data, &mut offset)? {
+            0x0000_800C => PccrcHashAlgoV1::Sha256,
+            0x0000_800D => PccrcHashAlgoV1::Sha384,
+            0x0000_800E => PccrcHashAlgoV1::Sha512,
+            value => {
+                return Err(crate::SmbMsgError::InvalidData(format!(
+                    "Unsupported v1 hash algo: 0x{value:08x}"
+                )))
+            }
+        };
+        let hash_len = hash_algo.hash_len();
+        let offset_in_first_segment = read_u32_le(data, &mut offset)?;
+        let read_bytes_in_last_segment = read_u32_le(data, &mut offset)?;
+        let segments_count = read_u32_le(data, &mut offset)? as usize;
+
+        let mut segments = Vec::with_capacity(segments_count);
+        for _ in 0..segments_count {
+            let offset_in_content = read_u64_le(data, &mut offset)?;
+            let segment_length = read_u32_le(data, &mut offset)?;
+            let block_size = read_u32_le(data, &mut offset)?;
+            let segment_hash_of_data = read_bytes(data, &mut offset, hash_len)?.to_vec();
+            let segment_secret = read_bytes(data, &mut offset, hash_len)?.to_vec();
+            segments.push(ContentInfoV1Segment {
+                offset_in_content,
+                segment_length,
+                block_size,
+                segment_hash_of_data,
+                segment_secret,
+                block_hashes: Vec::new(),
+            });
+        }
+
+        for segment in &mut segments {
+            let blocks_count = read_u32_le(data, &mut offset)? as usize;
+            let mut block_hashes = Vec::with_capacity(blocks_count);
+            for _ in 0..blocks_count {
+                block_hashes.push(read_bytes(data, &mut offset, hash_len)?.to_vec());
+            }
+            segment.block_hashes = block_hashes;
+        }
+
+        Ok(Self {
+            hash_algo,
+            offset_in_first_segment,
+            read_bytes_in_last_segment,
+            segments,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInformationV2 {
+    pub start_in_content: u64,
+    pub index_of_first_segment: u64,
+    pub offset_in_first_segment: u32,
+    pub length_of_range: u64,
+    pub segments: Vec<ContentInfoV2Segment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInfoV2Segment {
+    pub segment_length: u32,
+    pub segment_hash_of_data: [u8; 32],
+    pub segment_secret: [u8; 32],
+}
+
+impl ContentInformationV2 {
+    /// Parses Content Information v2.0 (big-endian).
+    /// See MS-PCCRC 2.4 and 2.4.1.
+    pub fn parse(data: &[u8]) -> crate::Result<Self> {
+        let mut offset = 0usize;
+        let minor = read_u8(data, &mut offset)?;
+        let major = read_u8(data, &mut offset)?;
+        if minor != 0x00 || major != 0x02 {
+            return Err(crate::SmbMsgError::InvalidData(format!(
+                "Unexpected v2 version: {major:#04x}.{minor:#04x}"
+            )));
+        }
+        let hash_algo = read_u8(data, &mut offset)?;
+        if hash_algo != 0x04 {
+            return Err(crate::SmbMsgError::InvalidData(format!(
+                "Unsupported v2 hash algo: 0x{hash_algo:02x}"
+            )));
+        }
+        let start_in_content = read_u64_be(data, &mut offset)?;
+        let index_of_first_segment = read_u64_be(data, &mut offset)?;
+        let offset_in_first_segment = read_u32_be(data, &mut offset)?;
+        let length_of_range = read_u64_be(data, &mut offset)?;
+
+        let mut segments = Vec::new();
+        while offset < data.len() {
+            let chunk_type = read_u8(data, &mut offset)?;
+            if chunk_type != 0x00 {
+                return Err(crate::SmbMsgError::InvalidData(format!(
+                    "Unsupported v2 chunk type: 0x{chunk_type:02x}"
+                )));
+            }
+            let chunk_len = read_u32_be(data, &mut offset)? as usize;
+            let chunk_end = offset.checked_add(chunk_len).ok_or_else(|| {
+                crate::SmbMsgError::InvalidData("Chunk length overflow".to_string())
+            })?;
+            if chunk_end > data.len() {
+                return Err(crate::SmbMsgError::InvalidData(
+                    "Chunk length exceeds buffer".to_string(),
+                ));
+            }
+            while offset < chunk_end {
+                let segment_length = read_u32_be(data, &mut offset)?;
+                let segment_hash_of_data = read_array_32(data, &mut offset)?;
+                let segment_secret = read_array_32(data, &mut offset)?;
+                segments.push(ContentInfoV2Segment {
+                    segment_length,
+                    segment_hash_of_data,
+                    segment_secret,
+                });
+            }
+            if offset != chunk_end {
+                return Err(crate::SmbMsgError::InvalidData(
+                    "Chunk data length misaligned".to_string(),
+                ));
+            }
+        }
+
+        Ok(Self {
+            start_in_content,
+            index_of_first_segment,
+            offset_in_first_segment,
+            length_of_range,
+            segments,
+        })
+    }
+}
+
+impl SrvHashRetrieveHashBased {
+    /// Parses the content information payload from this response.
+    pub fn content_information(&self) -> crate::Result<ContentInformation> {
+        ContentInformation::parse(&self.blob)
+    }
+}
+
+impl SrvHashRetrieveFileBased {
+    /// Parses the content information payload from this response.
+    pub fn content_information(&self) -> crate::Result<ContentInformation> {
+        ContentInformation::parse(&self.buffer)
+    }
+}
+
+fn read_u8(data: &[u8], offset: &mut usize) -> crate::Result<u8> {
+    if *offset + 1 > data.len() {
+        return Err(crate::SmbMsgError::InvalidData(
+            "Unexpected end of buffer".to_string(),
+        ));
+    }
+    let value = data[*offset];
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_u16_le(data: &[u8], offset: &mut usize) -> crate::Result<u16> {
+    let bytes = read_bytes(data, offset, 2)?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_le(data: &[u8], offset: &mut usize) -> crate::Result<u32> {
+    let bytes = read_bytes(data, offset, 4)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64_le(data: &[u8], offset: &mut usize) -> crate::Result<u64> {
+    let bytes = read_bytes(data, offset, 8)?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn read_u32_be(data: &[u8], offset: &mut usize) -> crate::Result<u32> {
+    let bytes = read_bytes(data, offset, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64_be(data: &[u8], offset: &mut usize) -> crate::Result<u64> {
+    let bytes = read_bytes(data, offset, 8)?;
+    Ok(u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
+fn read_array_32(data: &[u8], offset: &mut usize) -> crate::Result<[u8; 32]> {
+    let bytes = read_bytes(data, offset, 32)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+fn read_bytes<'a>(data: &'a [u8], offset: &mut usize, len: usize) -> crate::Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| crate::SmbMsgError::InvalidData("Offset overflow".to_string()))?;
+    if end > data.len() {
+        return Err(crate::SmbMsgError::InvalidData(
+            "Unexpected end of buffer".to_string(),
+        ));
+    }
+    let slice = &data[*offset..end];
+    *offset = end;
+    Ok(slice)
+}
 
 /// File-based response format for SRV_READ_HASH when HashRetrievalType is SRV_HASH_RETRIEVE_FILE_BASED.
 /// Valid for servers implementing the SMB 3.x dialect family.
@@ -398,7 +685,7 @@ pub struct SrvHashRetrieveFileBased {
     buffer_length: u32,
     reserved: u32,
     /// A variable-length buffer that contains the retrieved portion of the Content Information File.
-    /// TODO: Parse as Content Information File as specified in MS-PCCRC section 2.4.
+    /// Parse using ContentInformation per MS-PCCRC 2.4.
     #[br(count = buffer_length)]
     pub buffer: Vec<u8>,
 }
@@ -965,6 +1252,76 @@ mod tests {
             0000000000000000000000000000000000000000000000000000000000000000000000000000000000000
             0000000000000000000000000000000000000000000000000000000000000000000000000000000000000
             00000000000000000000"
+    }
+
+    #[test]
+    fn test_content_information_v1_parse() {
+        // MS-PCCRC 2.3 (little-endian).
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0100u16.to_le_bytes()); // Version 1.0
+        data.extend_from_slice(&0x0000_800Cu32.to_le_bytes()); // SHA-256
+        data.extend_from_slice(&0u32.to_le_bytes()); // dwOffsetInFirstSegment
+        data.extend_from_slice(&1u32.to_le_bytes()); // dwReadBytesInLastSegment
+        data.extend_from_slice(&1u32.to_le_bytes()); // cSegments
+        data.extend_from_slice(&0u64.to_le_bytes()); // ullOffsetInContent
+        data.extend_from_slice(&1u32.to_le_bytes()); // cbSegment
+        data.extend_from_slice(&65536u32.to_le_bytes()); // cbBlockSize
+        data.extend_from_slice(&[0x11; 32]); // SegmentHashOfData
+        data.extend_from_slice(&[0x22; 32]); // SegmentSecret
+        data.extend_from_slice(&1u32.to_le_bytes()); // cBlocks
+        data.extend_from_slice(&[0x33; 32]); // BlockHashes[0]
+
+        let parsed = ContentInformation::parse(&data).unwrap();
+        match parsed {
+            ContentInformation::V1(info) => {
+                assert_eq!(info.hash_algo, PccrcHashAlgoV1::Sha256);
+                assert_eq!(info.offset_in_first_segment, 0);
+                assert_eq!(info.read_bytes_in_last_segment, 1);
+                assert_eq!(info.segments.len(), 1);
+                let seg = &info.segments[0];
+                assert_eq!(seg.offset_in_content, 0);
+                assert_eq!(seg.segment_length, 1);
+                assert_eq!(seg.block_size, 65536);
+                assert_eq!(seg.segment_hash_of_data, vec![0x11; 32]);
+                assert_eq!(seg.segment_secret, vec![0x22; 32]);
+                assert_eq!(seg.block_hashes, vec![vec![0x33; 32]]);
+            }
+            _ => panic!("expected v1 content info"),
+        }
+    }
+
+    #[test]
+    fn test_content_information_v2_parse() {
+        // MS-PCCRC 2.4 (big-endian).
+        let mut data = Vec::new();
+        data.push(0x00); // bMinorVersion
+        data.push(0x02); // bMajorVersion
+        data.push(0x04); // bHashAlgo (truncated SHA-512)
+        data.extend_from_slice(&1u64.to_be_bytes()); // ullStartInContent
+        data.extend_from_slice(&2u64.to_be_bytes()); // ullIndexOfFirstSegment
+        data.extend_from_slice(&3u32.to_be_bytes()); // dwOffsetInFirstSegment
+        data.extend_from_slice(&4u64.to_be_bytes()); // ullLengthOfRange
+        data.push(0x00); // bChunkType
+        data.extend_from_slice(&68u32.to_be_bytes()); // chunk length
+        data.extend_from_slice(&0x1000u32.to_be_bytes()); // cbSegment
+        data.extend_from_slice(&[0x44; 32]); // SegmentHashOfData
+        data.extend_from_slice(&[0x55; 32]); // SegmentSecret
+
+        let parsed = ContentInformation::parse(&data).unwrap();
+        match parsed {
+            ContentInformation::V2(info) => {
+                assert_eq!(info.start_in_content, 1);
+                assert_eq!(info.index_of_first_segment, 2);
+                assert_eq!(info.offset_in_first_segment, 3);
+                assert_eq!(info.length_of_range, 4);
+                assert_eq!(info.segments.len(), 1);
+                let seg = &info.segments[0];
+                assert_eq!(seg.segment_length, 0x1000);
+                assert_eq!(seg.segment_hash_of_data, [0x44; 32]);
+                assert_eq!(seg.segment_secret, [0x55; 32]);
+            }
+            _ => panic!("expected v2 content info"),
+        }
     }
 
     // TODO(TEST): Add missing tests. Consider testing size calc as well.
