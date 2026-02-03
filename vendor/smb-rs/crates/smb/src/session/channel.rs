@@ -288,7 +288,8 @@ impl MessageHandler for ChannelMessageHandler {
         match &msg.message.content {
             ResponseContent::ServerToClientNotification(s2c_notification) => {
                 match s2c_notification.notification {
-                    // TODO: Move this to primary session
+                    // Session-close applies to the whole session; invalidation is idempotent
+                    // at the worker/transformer layer, so handle it here for any channel.
                     Notification::NotifySessionClosed(_) => self._invalidate().await,
                 }
             }

@@ -428,7 +428,7 @@ $(
                 [<CreateContext $struct_name Data>]::[<$context_type:camel $struct_name>](a) => Ok(a),
                 _ => Err(crate::SmbMsgError::UnexpectedContent {
                     expected: stringify!($req_type),
-                    actual: "", // self.data.name(), TODO: Fix this by making name() a string.
+                    actual: std::str::from_utf8(self.data.name()).unwrap_or("unknown"),
                 }),
             }
         }
