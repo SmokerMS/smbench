@@ -543,8 +543,11 @@ impl ResourceHandle {
     /// # Returns
     /// A `Result` containing the requested information, of type [QueryFileFullEaInformation].
     /// See [`ResourceHandle::query_info`] for more information.
+    /// # Notes
+    /// * For directory listing iteration, see [`Directory::query`] which provides a Stream-based iterator.
+    /// * EA (Extended Attributes) querying could benefit from a similar iterator pattern in the future.
+    /// * Reference: [MS-SMB2 2.2.33] SMB2 QUERY_DIRECTORY for directory iteration pattern.
     pub async fn query_full_ea_info_with_options(
-        // TODO: Make this a nicer iterator (like Directory listing).
         &self,
         names: Vec<&str>,
         output_buffer_length: Option<usize>,
