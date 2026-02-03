@@ -130,6 +130,10 @@ pub struct ConnectionConfig {
     /// If set to true, the client will NOT support notifications.
     pub disable_notifications: bool,
 
+    /// Whether to advertise RDMA transform capabilities during negotiation.
+    /// This is only effective when the `rdma` feature is enabled.
+    pub advertise_rdma: bool,
+
     /// Whether to avoid multi-protocol negotiation,
     /// and perform smb2-only negotiation. This results in a
     /// faster negotiation process, but it might fail with some servers,

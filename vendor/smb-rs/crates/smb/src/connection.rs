@@ -441,8 +441,7 @@ impl Connection {
                     ),
                 });
             }
-            // TODO: Add to config
-            if cfg!(feature = "rdma") {
+            if cfg!(feature = "rdma") && self.config.advertise_rdma {
                 ctx_list.push(NegotiateContext {
                     context_type: NegotiateContextType::RdmaTransformCapabilities,
                     data: NegotiateContextValue::RdmaTransformCapabilities(
