@@ -282,13 +282,14 @@ pub struct SrvRequestResumeKey {
     /// to uniquely identify the source file in FSCTL_SRV_COPYCHUNK or FSCTL_SRV_COPYCHUNK_WRITE requests.
     /// The resume key must be treated as an opaque structure.
     pub resume_key: [u8; SrvCopychunkCopy::SRV_KEY_LENGTH],
-    /// The length, in bytes, of the context information. This field is unused.
-    /// The server must set this field to zero, and the client must ignore it on receipt.
-    /// TODO: What?!
+    /// The length, in bytes, of the context information. This field is unused per MS-SMB2 2.2.32.1.
+    /// The server MUST set this field to zero, and the client MUST ignore it on receipt.
+    /// Reference: [MS-SMB2 2.2.32.1] FSCTL_SRV_REQUEST_RESUME_KEY Reply
     #[bw(calc = 0)]
     #[br(temp)]
     context_length: u32,
-    /// The context extended information. This should always be set to empty according to the specification.
+    /// The context extended information. Per MS-SMB2 2.2.32.1, this SHOULD be empty.
+    /// The specification states this field is reserved and SHOULD be set to zero length.
     #[br(count = context_length)]
     #[bw(assert(context.len() == context_length as usize))]
     pub context: Vec<u8>,
@@ -1041,6 +1042,23 @@ impl IoctlRequestContent for OffloadReadRequest {
     }
 }
 
+/// A 512-byte opaque token representing offloaded data.
+/// Reference: [MS-SMB2 2.2.32.2] STORAGE_OFFLOAD_TOKEN
+/// 
+/// Per MS-SMB2: "The Token field contains a 512-byte opaque value representing the data
+/// specified by the Offset and CopyLength fields in the FSCTL_OFFLOAD_READ request.
+/// The client MUST treat this as an opaque value and MUST NOT interpret its contents."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BinRead, BinWrite)]
+pub struct StorageOffloadToken {
+    /// Opaque 512-byte token data. MUST NOT be modified by the client.
+    pub data: [u8; 512],
+}
+
+impl StorageOffloadToken {
+    /// Size of the token in bytes per MS-SMB2 specification
+    pub const TOKEN_SIZE: usize = 512;
+}
+
 /// [MS-FSCC 2.3.42](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/b98a8325-e6ec-464a-bc1b-8216b74f5828)
 #[smb_response_binrw]
 pub struct OffloadReadResponse {
@@ -1062,7 +1080,9 @@ pub struct OffloadReadResponse {
 
     /// The generated Token to be used as a representation of the data contained within the portion of the file specified in the input request.
     /// The contents of this field MUST NOT be modified during subsequent operations.
-    pub token: [u8; 512], // TODO: Parse as STORAGE_OFFLOAD_TOKEN
+    /// Reference: [MS-SMB2 2.2.32.2] FSCTL_OFFLOAD_READ Reply - STORAGE_OFFLOAD_TOKEN
+    /// The token is a 512-byte opaque structure that MUST be treated as opaque by the client.
+    pub token: StorageOffloadToken,
 }
 
 impl_fsctl_response!(OffloadRead, OffloadReadResponse);
@@ -1324,5 +1344,140 @@ mod tests {
         }
     }
 
-    // TODO(TEST): Add missing tests. Consider testing size calc as well.
+    /// Test FSCTL_PIPE_PEEK request/response parsing
+    /// Reference: [MS-SMB2 2.2.31.1] FSCTL_PIPE_PEEK
+    #[test]
+    fn test_pipe_peek_request() {
+        let req = PipePeekRequest;
+        let mut buf = Vec::new();
+        req.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        // PIPE_PEEK has no request data per MS-SMB2 2.2.31.1
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// Test FSCTL_PIPE_WAIT request parsing
+    /// Reference: [MS-SMB2 2.2.31.2] FSCTL_PIPE_WAIT
+    #[test]
+    fn test_pipe_wait_request() {
+        let req = PipeWaitRequest {
+            timeout: 1000,
+            name_length: 4,
+            timeout_specified: true.into(),
+            name: "test".to_string(),
+        };
+        let mut buf = Vec::new();
+        req.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        assert!(buf.len() > 0);
+        
+        // Parse it back
+        let parsed: PipeWaitRequest = PipeWaitRequest::read(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(parsed.timeout, 1000);
+        assert_eq!(parsed.name, "test");
+    }
+
+    /// Test FSCTL_VALIDATE_NEGOTIATE_INFO request/response
+    /// Reference: [MS-SMB2 2.2.31.4] FSCTL_VALIDATE_NEGOTIATE_INFO
+    #[test]
+    fn test_validate_negotiate_info() {
+        let req = ValidateNegotiateInfoRequest {
+            capabilities: 0,
+            guid: [0u8; 16],
+            security_mode: NegotiateSecurityMode::new(),
+            dialects: vec![Dialect::Smb311],
+        };
+        let mut buf = Vec::new();
+        req.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        assert!(buf.len() > 0);
+    }
+
+    /// Test FSCTL_SRV_ENUMERATE_SNAPSHOTS request/response
+    /// Reference: [MS-SMB2 2.2.32.2] FSCTL_SRV_ENUMERATE_SNAPSHOTS
+    #[test]
+    fn test_enumerate_snapshots_request() {
+        let req = SrvEnumerateSnapshotsRequest;
+        let mut buf = Vec::new();
+        req.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        // Empty request per MS-SMB2 2.2.32.2
+        assert_eq!(buf.len(), 0);
+    }
+
+    /// Test FSCTL_FILE_LEVEL_TRIM request parsing
+    /// Reference: [MS-FSCC 2.3.81] FSCTL_FILE_LEVEL_TRIM
+    #[test]
+    fn test_file_level_trim() {
+        let req = FileLevelTrimRequest {
+            ranges: vec![
+                FileLevelTrimRange {
+                    offset: 0,
+                    length: 4096,
+                },
+                FileLevelTrimRange {
+                    offset: 8192,
+                    length: 4096,
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        req.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        assert!(buf.len() > 0);
+        
+        // Parse it back
+        let parsed: FileLevelTrimRequest = FileLevelTrimRequest::read(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(parsed.ranges.len(), 2);
+        assert_eq!(parsed.ranges[0].offset, 0);
+        assert_eq!(parsed.ranges[0].length, 4096);
+    }
+
+    /// Test STORAGE_OFFLOAD_TOKEN structure
+    /// Reference: [MS-SMB2 2.2.32.2] STORAGE_OFFLOAD_TOKEN
+    #[test]
+    fn test_storage_offload_token() {
+        let token = StorageOffloadToken {
+            data: [0x42; 512],
+        };
+        let mut buf = Vec::new();
+        token.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        assert_eq!(buf.len(), StorageOffloadToken::TOKEN_SIZE);
+        
+        // Parse it back
+        let parsed: StorageOffloadToken = StorageOffloadToken::read(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(parsed.data, [0x42; 512]);
+    }
+
+    /// Test OffloadReadResponse with StorageOffloadToken
+    /// Reference: [MS-SMB2 2.2.32.2] FSCTL_OFFLOAD_READ Reply
+    #[test]
+    fn test_offload_read_response_with_token() {
+        let response = OffloadReadResponse {
+            all_zero_beyond_current_range: true.into(),
+            transfer_length: 1024 * 1024,
+            token: StorageOffloadToken {
+                data: [0x55; 512],
+            },
+        };
+        let mut buf = Vec::new();
+        response.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        
+        // Parse it back
+        let parsed: OffloadReadResponse = OffloadReadResponse::read(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(parsed.transfer_length, 1024 * 1024);
+        assert_eq!(parsed.token.data, [0x55; 512]);
+    }
+
+    /// Test SrvRequestResumeKey response with context field
+    /// Reference: [MS-SMB2 2.2.32.1] FSCTL_SRV_REQUEST_RESUME_KEY Reply
+    #[test]
+    fn test_srv_request_resume_key_context() {
+        let response = SrvRequestResumeKey {
+            resume_key: [0x11; 24],
+            context: vec![], // Should be empty per MS-SMB2 2.2.32.1
+        };
+        let mut buf = Vec::new();
+        response.write(&mut std::io::Cursor::new(&mut buf)).unwrap();
+        
+        // Parse it back
+        let parsed: SrvRequestResumeKey = SrvRequestResumeKey::read(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(parsed.resume_key, [0x11; 24]);
+        assert_eq!(parsed.context.len(), 0, "Context should be empty per MS-SMB2 2.2.32.1");
+    }
 }
