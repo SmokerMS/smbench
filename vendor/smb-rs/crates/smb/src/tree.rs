@@ -246,24 +246,21 @@ impl Tree {
             .await
     }
 
-    // TODO: Make it common with ResourceHandle::fsctl_with_options
     #[maybe_async]
     pub(crate) async fn fsctl_with_options<T: FsctlRequest>(
         &self,
         request: T,
         max_output_response: u32,
     ) -> crate::Result<T::Response> {
-        const NO_INPUT_IN_RESPONSE: u32 = 0;
         let response = self
             .handler
-            .send_recv(RequestContent::Ioctl(IoctlRequest {
-                ctl_code: T::FSCTL_CODE as u32,
-                file_id: FileId::FULL,
-                max_input_response: NO_INPUT_IN_RESPONSE,
-                max_output_response,
-                flags: IoctlRequestFlags::new().with_is_fsctl(true),
-                buffer: request.into(),
-            }))
+            .send_recv(RequestContent::Ioctl(
+                crate::resource::ResourceHandle::build_fsctl_request(
+                    FileId::FULL,
+                    request,
+                    max_output_response,
+                ),
+            ))
             .await?
             .message
             .content

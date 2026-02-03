@@ -320,7 +320,8 @@ pub struct ResourceHandle {
     handler: HandlerReference<ResourceMessageHandle>,
 
     // Whether the resource is open or not.
-    // TODO: Consider using RwLock here on FileId instead of AtomicBool+FileId.
+    // Atomic open flag + immutable FileId avoids locking on hot paths; prefer this unless
+    // FileId must change post-open (then a lock would be required).
     open: AtomicBool,
 
     // Avoid accessing directly; use the `file_id()` getter,
@@ -751,6 +752,22 @@ impl ResourceHandle {
             .content
             .to_ioctl()?;
         Ok(result)
+    }
+
+    pub(crate) fn build_fsctl_request<T: FsctlRequest>(
+        file_id: FileId,
+        request: T,
+        max_output_response: u32,
+    ) -> IoctlRequest {
+        const NO_INPUT_IN_RESPONSE: u32 = 0;
+        IoctlRequest {
+            ctl_code: T::FSCTL_CODE as u32,
+            file_id,
+            max_input_response: NO_INPUT_IN_RESPONSE,
+            max_output_response,
+            flags: IoctlRequestFlags::new().with_is_fsctl(true),
+            buffer: request.into(),
+        }
     }
 
     /// Queries the file system information for the current file.
