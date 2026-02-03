@@ -99,8 +99,8 @@ impl IoctlRequestContent for SrvCopychunkCopy {
 pub struct SrvReadHashReq {
     /// The hash type of the request indicating what the hash is used for.
     /// Must be set to SRV_HASH_TYPE_PEER_DIST for branch caching.
-    #[bw(calc = 1)]
     #[br(assert(hash_type == 1))]
+    #[bw(assert(*hash_type == 1))]
     pub hash_type: u32,
     /// The version number of the algorithm used to create the Content Information.
     /// Must be set to version 1 (branch cache version 1) or version 2 (branch cache version 2).
@@ -110,11 +110,35 @@ pub struct SrvReadHashReq {
     pub hash_version: u32,
     /// Indicates the nature of the offset field and how it should be interpreted.
     pub hash_retrieval_type: SrvHashRetrievalType,
+    /// The offset within the Content Information File or source file, depending on retrieval type.
+    pub hash_offset: u64,
+    /// The number of bytes to retrieve.
+    pub hash_length: u32,
+    #[bw(assert(*_reserved == 0))]
+    _reserved: u32,
 }
 
 impl IoctlRequestContent for SrvReadHashReq {
     fn get_bin_size(&self) -> u32 {
-        size_of::<u32>() as u32 * 3
+        (size_of::<u32>() * 4 + size_of::<u64>()) as u32
+    }
+}
+
+impl SrvReadHashReq {
+    pub fn new(
+        hash_version: u32,
+        hash_retrieval_type: SrvHashRetrievalType,
+        hash_offset: u64,
+        hash_length: u32,
+    ) -> Self {
+        Self {
+            hash_type: 1,
+            hash_version,
+            hash_retrieval_type,
+            hash_offset,
+            hash_length,
+            _reserved: 0,
+        }
     }
 }
 
@@ -144,12 +168,21 @@ pub struct NetworkResiliencyRequest {
     /// The requested time the server holds the file open after a disconnect before releasing it.
     /// This time is in milliseconds.
     pub timeout: u32,
-    reserved: u32,
+    _reserved: u32,
 }
 
 impl IoctlRequestContent for NetworkResiliencyRequest {
     fn get_bin_size(&self) -> u32 {
         size_of::<u32>() as u32 * 2
+    }
+}
+
+impl NetworkResiliencyRequest {
+    pub fn new(timeout: u32) -> Self {
+        Self {
+            timeout,
+            _reserved: 0,
+        }
     }
 }
 
@@ -284,7 +317,12 @@ pub struct SrvCopychunkResponse {
     pub total_bytes_written: u32,
 }
 
-impl_fsctl_response!(SrvCopychunk, SrvCopychunkResponse);
+impl FsctlResponseContent for SrvCopychunkResponse {
+    const FSCTL_CODES: &'static [FsctlCodes] = &[
+        FsctlCodes::SrvCopychunk,
+        FsctlCodes::SrvCopychunkWrite,
+    ];
+}
 
 /// Response packet for SRV_READ_HASH requests.
 /// Returned by the server in an SMB2 IOCTL Response for FSCTL_SRV_READ_HASH request.
@@ -564,25 +602,52 @@ pub struct SetReparsePointRequest {
     /// Contains the reparse point tag that uniquely identifies the owner of the reparse point.
     #[bw(assert((reparse_tag & 0x80000000 == 0) == reparse_guid.is_some()))]
     pub reparse_tag: u32,
-    #[bw(calc = reparse_data.len() as u32)]
-    reparse_data_length: u32,
+    #[bw(assert(*reparse_data_length == reparse_data.len() as u16))]
+    reparse_data_length: u16,
+    #[bw(assert(*_reserved == 0))]
+    _reserved: u16,
     /// Applicable only for reparse points that have a GUID.
     /// See [MS-FSCC 2.1.2.3](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/a4d08374-0e92-43e2-8f88-88b94112f070)
     // Internal note: (HighBit(arseTag) == 0)Has
     #[br(if(reparse_tag & 0x80000000 == 0))]
+    #[bw(if(reparse_tag & 0x80000000 == 0))]
     pub reparse_guid: Option<Guid>,
     /// Reparse-specific data for the reparse point
     #[br(count = reparse_data_length)]
+    #[bw(write_with = write_reparse_data)]
     pub reparse_data: Vec<u8>,
 }
 
 impl IoctlRequestContent for SetReparsePointRequest {
     fn get_bin_size(&self) -> u32 {
         (size_of::<u32>()
-            + size_of::<u32>()
+            + size_of::<u16>()
+            + size_of::<u16>()
             + self.reparse_guid.as_ref().map_or(0, |_| size_of::<Guid>())
             + self.reparse_data.len()) as u32
     }
+}
+
+impl SetReparsePointRequest {
+    pub fn new(reparse_tag: u32, reparse_guid: Option<Guid>, reparse_data: Vec<u8>) -> Self {
+        Self {
+            reparse_tag,
+            reparse_data_length: reparse_data.len() as u16,
+            _reserved: 0,
+            reparse_guid,
+            reparse_data,
+        }
+    }
+}
+
+fn write_reparse_data<W: binrw::io::Write + binrw::io::Seek>(
+    value: &Vec<u8>,
+    writer: &mut W,
+    _endian: binrw::Endian,
+    _args: (),
+) -> binrw::BinResult<()> {
+    writer.write_all(value)?;
+    Ok(())
 }
 
 #[smb_request_binrw]

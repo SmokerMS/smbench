@@ -66,7 +66,7 @@ impl SMBBackend for SmbRsBackend {
         let mut lease_break_rx = conn.subscribe_lease_breaks()?;
 
         let share_path = smb::UncPath::from_str(&format!(
-            r"\\{}\\{}",
+            r"\\{}\{}",
             self.config.server, self.config.share
         ))?;
         client
@@ -324,7 +324,7 @@ fn build_args_from_extensions(
     mode: OpenMode,
     extensions: &serde_json::Value,
 ) -> smb::FileCreateArgs {
-    let desired_access = parse_desired_access(extensions).unwrap_or_else(|| match mode {
+    let mut desired_access = parse_desired_access(extensions).unwrap_or_else(|| match mode {
         OpenMode::Read => smb::FileAccessMask::new().with_generic_read(true),
         OpenMode::Write => smb::FileAccessMask::new().with_generic_write(true),
         OpenMode::ReadWrite => smb::FileAccessMask::new()
@@ -334,6 +334,15 @@ fn build_args_from_extensions(
 
     let disposition = parse_create_disposition(extensions).unwrap_or(smb::CreateDisposition::Open);
     let options = parse_create_options(extensions);
+    if extensions
+        .get("create_options")
+        .and_then(|v| v.get("delete_on_close"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        // delete-on-close requires DELETE access (MS-SMB2).
+        desired_access.set_delete(true);
+    }
     let attributes = parse_file_attributes(extensions).unwrap_or_else(smb::FileAttributes::new);
     let requested_oplock_level = parse_oplock_level(extensions).unwrap_or(smb::OplockLevel::None);
     let share_access = parse_share_access(extensions);

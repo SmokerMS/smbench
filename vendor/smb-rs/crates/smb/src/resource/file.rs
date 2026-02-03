@@ -1,5 +1,6 @@
 use super::file_util::*;
 use super::*;
+use smb_fscc::FileStandardInformation;
 #[cfg(not(feature = "async"))]
 use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
@@ -72,8 +73,17 @@ impl File {
             ));
         }
 
-        // EOF
-        if pos >= self.end_of_file {
+        // EOF: refresh EOF if our cached value is stale (e.g. after set_len).
+        let eof = if pos >= self.end_of_file {
+            let info: FileStandardInformation = self
+                .query_info()
+                .await
+                .map_err(std::io::Error::other)?;
+            info.end_of_file
+        } else {
+            self.end_of_file
+        };
+        if pos >= eof {
             return Ok(0);
         }
 
@@ -392,7 +402,8 @@ impl WriteAtChannel for File {
 impl GetLen for File {
     #[maybe_async]
     async fn get_len(&self) -> crate::Result<u64> {
-        Ok(self.end_of_file)
+        let info: FileStandardInformation = self.query_info().await?;
+        Ok(info.end_of_file)
     }
 }
 

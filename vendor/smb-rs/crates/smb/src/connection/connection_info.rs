@@ -65,4 +65,10 @@ pub struct ConnectionInfo {
     pub preauth_hash: PreauthHashState,
     /// The client GUID used for the connection.
     pub client_guid: Guid,
+    /// Client capabilities used in the negotiate request.
+    pub client_capabilities: GlobalCapabilities,
+    /// Client security mode used in the negotiate request.
+    pub client_security_mode: NegotiateSecurityMode,
+    /// Client dialects offered in the negotiate request.
+    pub client_dialects: Vec<Dialect>,
 }

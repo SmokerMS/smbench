@@ -74,6 +74,24 @@ impl DfsRequestData {
             + self.request_file_name.len() * size_of::<u16>() // + request_file_name (wstring)
             + self.site_name.len() * size_of::<u16>() // + site_name (wstring)
     }
+
+    pub fn new(request_file_name: &str, site_name: &str) -> Self {
+        Self {
+            request_file_name: SizedWideString::from(request_file_name),
+            site_name: SizedWideString::from(site_name),
+        }
+    }
+}
+
+impl ReqGetDfsReferralEx {
+    pub fn new(max_referral_level: ReferralLevel, request_file_name: &str, site_name: &str) -> Self {
+        Self {
+            max_referral_level: max_referral_level as u16,
+            request_flags: DfsRequestFlags::new().with_site_name(!site_name.is_empty()),
+            request_data_length: PosMarker::default(),
+            request_data: DfsRequestData::new(request_file_name, site_name),
+        }
+    }
 }
 
 /// NOTE: This struct currently implements [`BinWrite`] only as a placeholder (calling it will panic).

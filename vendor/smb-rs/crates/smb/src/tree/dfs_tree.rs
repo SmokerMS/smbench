@@ -51,6 +51,38 @@ impl<'a> DfsRootTreeRef<'a> {
             .parse_fsctl::<RespGetDfsReferral>()?;
         Ok(res)
     }
+
+    /// Performs a DFS referral EX request to the server.
+    /// This is used to get the referral information for a given path.
+    ///
+    /// See [MS-DFSC](<https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dfsc/04657125-a7d5-4c62-9bec-85af601fa14c>) for more information.
+    #[maybe_async]
+    pub async fn dfs_get_referrals_ex(
+        &self,
+        request: ReqGetDfsReferralEx,
+    ) -> crate::Result<RespGetDfsReferral> {
+        let res = self
+            .handler
+            .send_recvo(
+                IoctlRequest {
+                    ctl_code: FsctlCodes::DfsGetReferralsEx as u32,
+                    file_id: FileId::FULL,
+                    max_input_response: 1024,
+                    max_output_response: 1024,
+                    flags: IoctlRequestFlags::new().with_is_fsctl(true),
+                    buffer: IoctlReqData::FsctlDfsGetReferralsEx(request),
+                }
+                .into(),
+                ReceiveOptions::new().with_allow_async(true),
+            )
+            .await?;
+        let res = res
+            .message
+            .content
+            .to_ioctl()?
+            .parse_fsctl::<RespGetDfsReferral>()?;
+        Ok(res)
+    }
 }
 
 impl<'a> Deref for DfsRootTreeRef<'a> {

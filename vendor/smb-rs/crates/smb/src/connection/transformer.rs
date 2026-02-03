@@ -598,6 +598,7 @@ impl Transformer {
             let message = PlainResponse::read(&mut msg_cursor)?;
             responses.push((message, raw[offset..offset + msg_len].to_vec()));
 
+            offset += msg_len;
             if next == 0 {
                 break;
             }
@@ -606,7 +607,6 @@ impl Transformer {
                     "Compound response is not 8-byte aligned".to_string(),
                 ));
             }
-            offset += msg_len;
         }
 
         if offset < raw.len() {

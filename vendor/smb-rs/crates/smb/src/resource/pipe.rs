@@ -6,7 +6,7 @@ use std::{
 use super::ResourceHandle;
 use crate::msg_handler::{OutgoingMessage, ReceiveOptions};
 use maybe_async::*;
-use smb_msg::{IoctlBuffer, PipeTransceiveRequest, ReadRequest, WriteRequest};
+use smb_msg::{FsctlRequest, IoctlBuffer, PipeTransceiveRequest, ReadRequest, WriteRequest};
 use smb_rpc::{SmbRpcError, interface::*, ndr64::NDR64_SYNTAX_ID, pdu::*};
 pub struct Pipe {
     handle: ResourceHandle,
@@ -16,6 +16,20 @@ pub struct Pipe {
 impl Pipe {
     pub fn new(handle: ResourceHandle) -> Self {
         Pipe { handle }
+    }
+
+    pub async fn fsctl<T: FsctlRequest>(&self, request: T) -> crate::Result<T::Response> {
+        self.handle.fsctl(request).await
+    }
+
+    pub async fn fsctl_with_options<T: FsctlRequest>(
+        &self,
+        request: T,
+        max_output_response: u32,
+    ) -> crate::Result<T::Response> {
+        self.handle
+            .fsctl_with_options(request, max_output_response)
+            .await
     }
 
     pub async fn bind<I>(self) -> crate::Result<I>

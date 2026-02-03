@@ -238,6 +238,14 @@ impl Tree {
         Ok(())
     }
 
+    /// Sends an FSCTL message scoped to this tree (share).
+    #[maybe_async]
+    pub async fn fsctl<T: FsctlRequest>(&self, request: T) -> crate::Result<T::Response> {
+        const DEFAULT_RESPONSE_OUT_SIZE: u32 = 1024;
+        self.fsctl_with_options(request, DEFAULT_RESPONSE_OUT_SIZE)
+            .await
+    }
+
     // TODO: Make it common with ResourceHandle::fsctl_with_options
     #[maybe_async]
     pub(crate) async fn fsctl_with_options<T: FsctlRequest>(

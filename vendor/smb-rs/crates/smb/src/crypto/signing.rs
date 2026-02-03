@@ -75,18 +75,24 @@ mod hmac_signer {
 
     #[derive(Debug, Clone)]
     pub struct HmacSha256Signer {
+        key: SigningKey,
         hmac: Option<HmacSha256>,
     }
 
     impl HmacSha256Signer {
         pub fn build(signing_key: &SigningKey) -> Box<dyn SigningAlgo> {
             Box::new(HmacSha256Signer {
+                key: *signing_key,
                 hmac: Some(HmacSha256::new_from_slice(signing_key).unwrap()),
             })
         }
     }
 
     impl SigningAlgo for HmacSha256Signer {
+        fn start(&mut self, _header: &Header) {
+            self.hmac = Some(HmacSha256::new_from_slice(&self.key).unwrap());
+        }
+
         fn update(&mut self, data: &[u8]) {
             self.hmac.as_mut().unwrap().update(data);
         }

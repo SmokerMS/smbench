@@ -191,9 +191,7 @@ pub struct IoctlResponse {
     #[br(temp)]
     input_offset: PosMarker<u32>,
     /// Should be set to zero (exception for pass-through operations)
-    #[bw(assert(in_buffer.is_empty()))] // there is an exception for pass-through operations.
     #[bw(try_calc = in_buffer.len().try_into())]
-    #[br(assert(input_count == 0))]
     #[br(temp)]
     input_count: u32,
 

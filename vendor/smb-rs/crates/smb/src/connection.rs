@@ -33,6 +33,12 @@ use worker::{Worker, WorkerImpl};
 #[cfg(feature = "async")]
 use tokio::sync::broadcast;
 
+struct ClientNegotiateInfo {
+    capabilities: GlobalCapabilities,
+    security_mode: NegotiateSecurityMode,
+    dialects: Vec<Dialect>,
+}
+
 /// Represents an SMB connection.
 ///
 /// Each SMB connection has a single matching transport (e.g. TCP connection).
@@ -299,19 +305,16 @@ impl Connection {
         };
 
         // Send SMB2 negotiate request
+        let (negotiate_request, client_neg_info) = self._make_smb2_neg_request(
+            dialects,
+            crypto::SIGNING_ALGOS.to_vec(),
+            encryption_algos,
+            compression::SUPPORTED_ALGORITHMS.to_vec(),
+        );
         let (request_status, response) = self
             .handler
             .sendor_recv(
-                OutgoingMessage::new(
-                    self._make_smb2_neg_request(
-                        dialects,
-                        crypto::SIGNING_ALGOS.to_vec(),
-                        encryption_algos,
-                        compression::SUPPORTED_ALGORITHMS.to_vec(),
-                    )
-                    .into(),
-                )
-                .with_return_raw_data(true),
+                OutgoingMessage::new(negotiate_request.into()).with_return_raw_data(true),
             )
             .await?;
 
@@ -379,6 +382,9 @@ impl Connection {
             preauth_hash,
             client_guid: self.handler.client_guid,
             server_address,
+            client_capabilities: client_neg_info.capabilities,
+            client_security_mode: client_neg_info.security_mode,
+            client_dialects: client_neg_info.dialects,
         })
     }
 
@@ -389,7 +395,7 @@ impl Connection {
         signing_algorithms: Vec<SigningAlgorithmId>,
         encrypting_algorithms: Vec<EncryptionCipher>,
         compression_algorithms: Vec<CompressionAlgorithm>,
-    ) -> NegotiateRequest {
+    ) -> (NegotiateRequest, ClientNegotiateInfo) {
         let client_guid = self.handler.client_guid;
         let client_netname = self
             .config
@@ -479,13 +485,19 @@ impl Connection {
 
         let security_mode = NegotiateSecurityMode::new().with_signing_enabled(has_signing);
 
-        NegotiateRequest {
+        let request = NegotiateRequest {
             security_mode,
             capabilities,
             client_guid,
             dialects: supported_dialects,
             negotiate_context_list: ctx_list,
-        }
+        };
+        let info = ClientNegotiateInfo {
+            capabilities,
+            security_mode,
+            dialects: request.dialects.clone(),
+        };
+        (request, info)
     }
 
     /// Performs SMB negotiation post-connect.
