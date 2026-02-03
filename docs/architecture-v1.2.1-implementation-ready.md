@@ -704,17 +704,17 @@ impl SMBConnection for SmbRsConnection {
         // Mode 2: Add oplock request
         let mut args = self.build_args_from_details(details);
         
-        // TODO: Validate smb-rs API for oplock request
-        // args = args.with_oplock(details.requested_oplock)?;
+        // smb-rs supports oplock requests via FileCreateArgs.requested_oplock_level
+        // (see src/backend/smbrs.rs build_args_from_extensions).
         
         let file = self.client.create_file(&path, &args).await?;
         
-        // TODO: Extract granted oplock from response
-        // let granted_oplock = file.granted_oplock_level()?;
+        // Granted oplock is available on the File handle:
+        // let granted_oplock = file.granted_oplock_level();
         
         Ok(Box::new(SmbRsFileHandle {
             file,
-            granted_oplock: None,  // TODO: From response
+            granted_oplock: Some(map_smb_oplock(file.granted_oplock_level())),
         }))
     }
 }
@@ -896,22 +896,19 @@ async fn test_smb_rs_oplock_complete_workflow() {
     client2.share_connect(&share, "user2", "pass".into()).await?;
     
     // Test 1: Can we request oplock?
-    // TODO: Check smb-rs API documentation
-    let args = FileCreateArgs::new(...)
-        /* .with_oplock(OplockLevel::Batch) */;  // ← VALIDATE THIS EXISTS
+    let mut args = FileCreateArgs::make_open_existing(
+        FileAccessMask::new().with_generic_read(true),
+    );
+    args.requested_oplock_level = OplockLevel::Batch;
     
     let file1 = client1.create_file(&"test.txt", &args).await?;
     
     // Test 2: Can we query granted oplock?
-    // let granted = file1.granted_oplock_level();  // ← VALIDATE THIS EXISTS
-    // assert_eq!(granted, Some(OplockLevel::Batch));
+    let granted = file1.granted_oplock_level();
+    assert_eq!(granted, OplockLevel::Batch);
     
     // Test 3: Can we receive oplock breaks?
-    // Option A: Does Client have oplock_breaks() channel?
-    // Option B: Does File have break_notifications() channel?
-    // Option C: Not supported?
-    
-    // let mut breaks = client1.oplock_breaks();  // ← VALIDATE
+    let mut breaks = client1.subscribe_oplock_breaks().await?;
     
     // Trigger break: client2 opens same file
     tokio::spawn(async move {

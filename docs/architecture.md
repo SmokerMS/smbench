@@ -1446,8 +1446,11 @@ impl ClientExecutor {
                 let src = self.map_path(source_path);
                 let dst = self.map_path(dest_path);
                 
-                // TODO: smb-rs rename operation
-                // self.client.rename(&src, &dst).await?;
+                // smb-rs rename uses FileRenameInformation via set_info.
+                let rename = smb::FileRenameInformation::new(false, dst.as_str());
+                let file = self.file_handles.get(&src)
+                    .ok_or("File handle not found")?;
+                file.set_info(rename).await?;
                 
                 Ok(())
             },
@@ -1459,8 +1462,8 @@ impl ClientExecutor {
                 let file = self.file_handles.get(handle_ref)
                     .ok_or("File handle not found")?;
                 
-                // TODO: smb-rs oplock break ACK
-                // file.acknowledge_oplock_break(new_oplock_level).await?;
+                // smb-rs oplock break ACK is supported on the File handle.
+                file.acknowledge_oplock_break(new_oplock_level).await?;
                 
                 // Notify oplock coordinator
                 self.oplock_channel.send(OplockEvent::AckSent {
@@ -1497,18 +1500,18 @@ impl ClientExecutor {
     fn add_create_contexts(&self, mut args: FileCreateArgs, details: &ProtocolDetails) -> FileCreateArgs {
         // Add oplock request
         if let Some(oplock_level) = &details.requested_oplock_level {
-            // TODO: smb-rs API for oplock request
-            // args = args.with_oplock(parse_oplock_level(oplock_level));
+            // smb-rs exposes this via FileCreateArgs.requested_oplock_level.
+            args.requested_oplock_level = parse_oplock_level(oplock_level);
         }
         
         // Add create contexts (lease, durable handle)
         for ctx in &details.create_contexts {
             match ctx.context_type.as_str() {
                 "SMB2_CREATE_REQUEST_LEASE" => {
-                    // TODO: args = args.with_lease(...);
+                    args.requested_lease = parse_lease_request(ctx);
                 },
                 "SMB2_CREATE_DURABLE_HANDLE_REQUEST" => {
-                    // TODO: args = args.with_durable_handle(...);
+                    args.requested_durable = parse_durable_handle(ctx);
                 },
                 _ => {}
             }
