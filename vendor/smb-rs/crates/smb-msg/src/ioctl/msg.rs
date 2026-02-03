@@ -105,10 +105,12 @@ pub enum IoctlReqData {
         [<Fsctl $fsctl:camel>]($model),
     )+
 
-    /// General, non-smb FSCTL ioctl buffer.
-    ///
-    /// In case of an unsupported FSCTL code, this variant can be used to
-    /// pass raw bytes.
+    /// Raw FSCTL buffer for unsupported FSCTL codes.
+    #[br(pre_assert(flags.is_fsctl()))]
+    FsctlRaw(IoctlBuffer),
+
+    /// Raw IOCTL buffer for non-FSCTL control codes.
+    #[br(pre_assert(!flags.is_fsctl()))]
     Ioctl(IoctlBuffer),
 }
 
@@ -119,6 +121,7 @@ impl IoctlReqData {
             $(
                 [<Fsctl $fsctl:camel>](data) => data.get_bin_size(),
             )+
+            FsctlRaw(data) => data.len() as u32,
             Ioctl(data) => data.len() as u32,
         }
     }
@@ -140,7 +143,6 @@ $(
     }
 }
 
-// TODO: Enable non-fsctl ioctls. currently, we only support FSCTLs.
 ioctl_req_data! {
     PipePeek: PipePeekRequest, PipePeekResponse,
     SrvEnumerateSnapshots: SrvEnumerateSnapshotsRequest, SrvEnumerateSnapshotsResponse,
@@ -248,6 +250,7 @@ impl IoctlResponse {
 
 #[cfg(test)]
 mod tests {
+    use binrw::prelude::*;
     use smb_tests::*;
 
     use crate::*;
@@ -289,5 +292,51 @@ mod tests {
                 in_buffer: vec![],
                 out_buffer: smb_tests::hex_to_u8_array! {IOCTL_TEST_BUFFER_CONTENT},
         } => const_format::concatcp!("3100000017c01100280500000c000000850000000c000000700000000000000070000000040100000000000000000000",IOCTL_TEST_BUFFER_CONTENT)
+    }
+
+    #[test]
+    fn test_ioctl_request_non_fsctl_roundtrip() {
+        let request = IoctlRequest {
+            ctl_code: 0x0009_0004,
+            file_id: FileId::FULL,
+            max_input_response: 0,
+            max_output_response: 16,
+            flags: IoctlRequestFlags::new().with_is_fsctl(false),
+            buffer: IoctlReqData::Ioctl(IoctlBuffer::from(vec![0x01, 0x02, 0x03])),
+        };
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        request.write_le(&mut cursor).unwrap();
+        cursor.set_position(0);
+        let parsed: IoctlRequest = cursor.read_le().unwrap();
+        assert!(!parsed.flags.is_fsctl());
+        assert_eq!(parsed.ctl_code, 0x0009_0004);
+        match parsed.buffer {
+            IoctlReqData::Ioctl(buf) => assert_eq!(&*buf, &[0x01, 0x02, 0x03]),
+            _ => panic!("expected Ioctl raw buffer"),
+        }
+    }
+
+    #[test]
+    fn test_ioctl_request_fsctl_raw_roundtrip() {
+        let request = IoctlRequest {
+            ctl_code: 0x0009_0003, // not a known FSCTL code
+            file_id: FileId::FULL,
+            max_input_response: 0,
+            max_output_response: 8,
+            flags: IoctlRequestFlags::new().with_is_fsctl(true),
+            buffer: IoctlReqData::FsctlRaw(IoctlBuffer::from(vec![0xaa, 0xbb])),
+        };
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        request.write_le(&mut cursor).unwrap();
+        cursor.set_position(0);
+        let parsed: IoctlRequest = cursor.read_le().unwrap();
+        assert!(parsed.flags.is_fsctl());
+        assert_eq!(parsed.ctl_code, 0x0009_0003);
+        match parsed.buffer {
+            IoctlReqData::FsctlRaw(buf) => assert_eq!(&*buf, &[0xaa, 0xbb]),
+            _ => panic!("expected FsctlRaw buffer"),
+        }
     }
 }
