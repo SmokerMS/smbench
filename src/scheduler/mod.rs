@@ -12,6 +12,43 @@ use tokio::time::{sleep_until, Duration, Instant};
 use crate::backend::{ConnectionState, SMBBackend};
 use crate::ir::{Operation, WorkloadIr};
 
+/// Summary returned after a scheduler run completes.
+#[derive(Debug, Clone)]
+pub struct RunSummary {
+    /// Total operations dispatched to workers.
+    pub dispatched: u64,
+    /// Total operations completed successfully.
+    pub succeeded: u64,
+    /// Total operations completed with error.
+    pub failed: u64,
+    /// Invariant violations detected during the run.
+    pub invariant_violations: u64,
+    /// Wall-clock duration of the entire run.
+    pub wall_clock: Duration,
+    /// Per-client latency statistics.
+    pub client_stats: Vec<ClientLatencyStats>,
+}
+
+/// Latency statistics for a single client.
+#[derive(Debug, Clone)]
+pub struct ClientLatencyStats {
+    pub client_id: String,
+    pub operation_count: u64,
+    pub min_latency: Duration,
+    pub max_latency: Duration,
+    pub total_latency: Duration,
+}
+
+impl ClientLatencyStats {
+    pub fn mean_latency(&self) -> Duration {
+        if self.operation_count == 0 {
+            Duration::ZERO
+        } else {
+            self.total_latency / self.operation_count as u32
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ScheduledEvent {
     pub deadline_us: u64,
@@ -83,7 +120,54 @@ pub enum InvariantMode {
 struct SchedulerMetrics {
     dispatch_count: AtomicU64,
     completion_count: AtomicU64,
+    error_count: AtomicU64,
     invariant_violations: AtomicU64,
+}
+
+/// Tracks per-client latency accumulation during a run.
+struct ClientLatencyAccumulator {
+    client_id: String,
+    count: u64,
+    min: Duration,
+    max: Duration,
+    total: Duration,
+}
+
+impl ClientLatencyAccumulator {
+    fn new(client_id: String) -> Self {
+        Self {
+            client_id,
+            count: 0,
+            min: Duration::from_secs(u64::MAX),
+            max: Duration::ZERO,
+            total: Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, latency: Duration) {
+        self.count += 1;
+        if latency < self.min {
+            self.min = latency;
+        }
+        if latency > self.max {
+            self.max = latency;
+        }
+        self.total += latency;
+    }
+
+    fn into_stats(self) -> ClientLatencyStats {
+        ClientLatencyStats {
+            client_id: self.client_id,
+            operation_count: self.count,
+            min_latency: if self.count == 0 {
+                Duration::ZERO
+            } else {
+                self.min
+            },
+            max_latency: self.max,
+            total_latency: self.total,
+        }
+    }
 }
 
 pub struct Scheduler {
@@ -105,6 +189,9 @@ pub struct Scheduler {
     watchdog_interval: Duration,
     inflight_timeout: Duration,
     metrics: SchedulerMetrics,
+    latency_accumulators: Vec<ClientLatencyAccumulator>,
+    /// Shared connection map so we can clean up after the run.
+    connection_map: Option<Arc<Mutex<HashMap<u32, Arc<Mutex<ConnectionState>>>>>>,
 }
 
 impl Scheduler {
@@ -153,6 +240,11 @@ impl Scheduler {
         let (work_tx, work_rx) = mpsc::channel(config.max_concurrent * 2 + 1);
         let (completion_tx, completion_rx) = mpsc::channel(config.max_concurrent * 2 + 1);
 
+        let latency_accumulators = client_queues
+            .iter()
+            .map(|q| ClientLatencyAccumulator::new(q.client_id.clone()))
+            .collect();
+
         Ok(Self {
             heap,
             client_queues,
@@ -171,12 +263,15 @@ impl Scheduler {
             watchdog_interval: config.watchdog_interval,
             inflight_timeout: config.inflight_timeout,
             metrics: SchedulerMetrics::default(),
+            latency_accumulators,
+            connection_map: None,
         })
     }
 
-    pub async fn run(mut self, backend: Arc<dyn SMBBackend>) -> Result<()> {
+    pub async fn run(mut self, backend: Arc<dyn SMBBackend>) -> Result<RunSummary> {
         crate::backend::ensure_backend_allowed(backend.as_ref(), self.backend_mode)?;
-        self.start_time = Some(Instant::now());
+        let run_start = Instant::now();
+        self.start_time = Some(run_start);
         self.spawn_workers(backend).await?;
 
         loop {
@@ -219,7 +314,46 @@ impl Scheduler {
             }
         }
 
-        Ok(())
+        // Connection cleanup: close all open handles and drop connections.
+        self.cleanup_connections().await;
+
+        let wall_clock = run_start.elapsed();
+        let dispatched = self.metrics.dispatch_count.load(AtomicOrdering::Relaxed);
+        let completed = self.metrics.completion_count.load(AtomicOrdering::Relaxed);
+        let failed = self.metrics.error_count.load(AtomicOrdering::Relaxed);
+        let invariant_violations = self
+            .metrics
+            .invariant_violations
+            .load(AtomicOrdering::Relaxed);
+        let client_stats = self
+            .latency_accumulators
+            .drain(..)
+            .map(|a| a.into_stats())
+            .collect();
+
+        Ok(RunSummary {
+            dispatched,
+            succeeded: completed.saturating_sub(failed),
+            failed,
+            invariant_violations,
+            wall_clock,
+            client_stats,
+        })
+    }
+
+    /// Close all connections and their handles after a workload completes.
+    async fn cleanup_connections(&mut self) {
+        if let Some(conn_map) = self.connection_map.take() {
+            let mut map = conn_map.lock().await;
+            let keys: Vec<u32> = map.keys().copied().collect();
+            for key in keys {
+                if let Some(conn_arc) = map.remove(&key) {
+                    let mut conn = conn_arc.lock().await;
+                    conn.close_all_handles().await;
+                }
+            }
+            tracing::debug!("All connections cleaned up");
+        }
     }
 
     fn find_next_eligible_deadline(&self) -> Option<Instant> {
@@ -310,12 +444,21 @@ impl Scheduler {
             );
         }
 
-        let queue = &mut self.client_queues[completion.client_idx as usize];
+        let idx = completion.client_idx as usize;
+        let queue = &mut self.client_queues[idx];
         queue.in_flight_op = None;
         queue.in_flight_started = None;
         self.metrics
             .completion_count
             .fetch_add(1, AtomicOrdering::Relaxed);
+        if matches!(completion.status, CompletionStatus::Error { .. }) {
+            self.metrics
+                .error_count
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        if idx < self.latency_accumulators.len() {
+            self.latency_accumulators[idx].record(completion.latency);
+        }
         if let Some(next_op) = queue.pending_ops.front() {
             let deadline_us = (next_op.timestamp_us() as f64 * self.time_scale) as u64;
             self.heap.push(std::cmp::Reverse(ScheduledEvent {
@@ -421,6 +564,7 @@ impl Scheduler {
         let work_rx = Arc::new(Mutex::new(work_rx));
         let connection_map: Arc<Mutex<HashMap<u32, Arc<Mutex<ConnectionState>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        self.connection_map = Some(connection_map.clone());
         let completion_tx = self.completion_tx.clone();
 
         for _ in 0..self.worker_count {

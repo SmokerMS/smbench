@@ -10,6 +10,9 @@ use crate::ir::{OpenMode, Operation};
 #[cfg(feature = "smb-rs-backend")]
 pub mod smbrs;
 
+#[cfg(feature = "impacket-backend")]
+pub mod impacket;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendMode {
     Development,
@@ -146,6 +149,28 @@ impl ConnectionState {
 
     pub fn take_oplock_receiver(&mut self) -> Option<mpsc::Receiver<OplockBreak>> {
         self.oplock_break_rx.take()
+    }
+
+    /// Close all open handles. Used during scheduler cleanup after workload completion.
+    pub async fn close_all_handles(&mut self) {
+        let refs: Vec<String> = self.handles.keys().cloned().collect();
+        for handle_ref in refs {
+            if let Some(entry) = self.handles.remove(&handle_ref) {
+                if let Some(file_id) = entry.handle.file_id() {
+                    self.file_id_map.remove(&file_id);
+                }
+                if let Some(lease_key) = entry.handle.lease_key() {
+                    self.lease_key_map.remove(&lease_key);
+                }
+                if let Err(err) = entry.handle.close().await {
+                    tracing::warn!(
+                        handle_ref = handle_ref,
+                        error = %err,
+                        "Failed to close handle during cleanup"
+                    );
+                }
+            }
+        }
     }
 
     pub async fn execute(&mut self, op: &Operation) -> Result<()> {

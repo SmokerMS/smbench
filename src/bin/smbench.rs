@@ -261,7 +261,15 @@ async fn run_workload(cli: &Cli, ir_path: &std::path::Path) -> Result<()> {
     };
 
     let scheduler = Scheduler::from_ir(ir, config)?;
-    scheduler.run(backend).await?;
+    let summary = scheduler.run(backend).await?;
+    println!(
+        "Run complete: dispatched={}, succeeded={}, failed={}, violations={}, wall_clock={:.2}s",
+        summary.dispatched,
+        summary.succeeded,
+        summary.failed,
+        summary.invariant_violations,
+        summary.wall_clock.as_secs_f64()
+    );
     Ok(())
 }
 

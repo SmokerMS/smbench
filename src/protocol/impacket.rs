@@ -52,6 +52,16 @@ pub enum WorkerRequest {
         connection_id: String,
         path: String,
     },
+    Mkdir {
+        request_id: String,
+        connection_id: String,
+        path: String,
+    },
+    Rmdir {
+        request_id: String,
+        connection_id: String,
+        path: String,
+    },
     Shutdown,
 }
 
@@ -93,6 +103,16 @@ pub enum WorkerResponse {
         error: Option<String>,
     },
     Deleted {
+        request_id: String,
+        success: bool,
+        error: Option<String>,
+    },
+    MkdirResult {
+        request_id: String,
+        success: bool,
+        error: Option<String>,
+    },
+    RmdirResult {
         request_id: String,
         success: bool,
         error: Option<String>,

@@ -208,6 +208,53 @@ impl SMBConnectionInner for SmbRsConnection {
                 file.close().await.map_err(|e| anyhow!(e))?;
                 Ok(())
             }
+            Operation::Mkdir { path, .. } => {
+                let target = resolve_unc_path(&self.share_path, path)?;
+                let access = smb::FileAccessMask::new()
+                    .with_generic_read(true)
+                    .with_generic_write(true);
+                let args = smb::FileCreateArgs {
+                    disposition: smb::CreateDisposition::OpenIf,
+                    attributes: smb::FileAttributes::new().with_directory(true),
+                    options: smb::CreateOptions::new().with_directory_file(true),
+                    desired_access: access,
+                    requested_oplock_level: smb::OplockLevel::None,
+                    requested_lease: None,
+                    requested_durable: None,
+                    share_access: None,
+                };
+                let resource = self.client.create_file(&target, &args).await?;
+                let file: smb::File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _)) => return Err(anyhow!(err)),
+                };
+                file.close().await.map_err(|e| anyhow!(e))?;
+                Ok(())
+            }
+            Operation::Rmdir { path, .. } => {
+                let target = resolve_unc_path(&self.share_path, path)?;
+                let access = smb::FileAccessMask::new().with_generic_all(true);
+                let args = smb::FileCreateArgs {
+                    disposition: smb::CreateDisposition::Open,
+                    attributes: smb::FileAttributes::new().with_directory(true),
+                    options: smb::CreateOptions::new().with_directory_file(true),
+                    desired_access: access,
+                    requested_oplock_level: smb::OplockLevel::None,
+                    requested_lease: None,
+                    requested_durable: None,
+                    share_access: None,
+                };
+                let resource = self.client.create_file(&target, &args).await?;
+                let file: smb::File = match resource.try_into() {
+                    Ok(file) => file,
+                    Err((err, _)) => return Err(anyhow!(err)),
+                };
+                file.set_info(smb::FileDispositionInformation::default())
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+                file.close().await.map_err(|e| anyhow!(e))?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -397,12 +444,27 @@ fn resolve_rename_target(share: &smb::UncPath, dest_path: &str) -> Result<String
 }
 
 fn parse_oplock_level(ext: &serde_json::Value) -> Option<smb::OplockLevel> {
-    let value = ext.get("oplock_level").or_else(|| ext.get("oplock"))?;
-    let value = value.as_str()?.to_lowercase();
+    let raw = ext.get("oplock_level").or_else(|| ext.get("oplock"))?;
+
+    // Try numeric first (MS-SMB2 2.2.14: 0x00=None, 0x02=II, 0x08=Batch, 0x09=Lease)
+    if let Some(n) = raw.as_u64() {
+        return match n {
+            0x00 => Some(smb::OplockLevel::None),
+            0x02 => Some(smb::OplockLevel::II),
+            0x08 => Some(smb::OplockLevel::Exclusive), // Batch → maps to Exclusive in smb-rs
+            0x09 => Some(smb::OplockLevel::Lease),
+            _ => None,
+        };
+    }
+
+    // String values
+    let value = raw.as_str()?.to_lowercase();
     match value.as_str() {
-        "none" => Some(smb::OplockLevel::None),
-        "read" | "ii" => Some(smb::OplockLevel::II),
+        "none" | "0" => Some(smb::OplockLevel::None),
+        "read" | "ii" | "2" => Some(smb::OplockLevel::II),
         "exclusive" => Some(smb::OplockLevel::Exclusive),
+        "batch" | "8" => Some(smb::OplockLevel::Exclusive), // Batch → Exclusive
+        "lease" | "9" => Some(smb::OplockLevel::Lease),
         _ => None,
     }
 }
@@ -582,14 +644,30 @@ fn parse_desired_access(ext: &serde_json::Value) -> Option<smb::FileAccessMask> 
 }
 
 fn parse_create_disposition(ext: &serde_json::Value) -> Option<smb::CreateDisposition> {
-    let value = ext.get("create_disposition")?.as_str()?.to_lowercase();
+    let raw = ext.get("create_disposition")?;
+
+    // Try numeric first (MS-SMB2 2.2.13: 0-5)
+    if let Some(n) = raw.as_u64() {
+        return match n {
+            0 => Some(smb::CreateDisposition::Superseded),
+            1 => Some(smb::CreateDisposition::Open),
+            2 => Some(smb::CreateDisposition::Create),
+            3 => Some(smb::CreateDisposition::OpenIf),
+            4 => Some(smb::CreateDisposition::Overwrite),
+            5 => Some(smb::CreateDisposition::OverwriteIf),
+            _ => None,
+        };
+    }
+
+    // String values
+    let value = raw.as_str()?.to_lowercase();
     match value.as_str() {
-        "supersede" => Some(smb::CreateDisposition::Superseded),
-        "open" => Some(smb::CreateDisposition::Open),
-        "create" => Some(smb::CreateDisposition::Create),
-        "open_if" => Some(smb::CreateDisposition::OpenIf),
-        "overwrite" => Some(smb::CreateDisposition::Overwrite),
-        "overwrite_if" => Some(smb::CreateDisposition::OverwriteIf),
+        "supersede" | "0" => Some(smb::CreateDisposition::Superseded),
+        "open" | "1" => Some(smb::CreateDisposition::Open),
+        "create" | "2" => Some(smb::CreateDisposition::Create),
+        "open_if" | "3" => Some(smb::CreateDisposition::OpenIf),
+        "overwrite" | "4" => Some(smb::CreateDisposition::Overwrite),
+        "overwrite_if" | "5" => Some(smb::CreateDisposition::OverwriteIf),
         _ => None,
     }
 }
@@ -777,6 +855,33 @@ mod tests {
 
         let ext = serde_json::json!({"oplock_level": "unknown"});
         assert_eq!(parse_oplock_level(&ext), None);
+
+        // Batch string maps to Exclusive
+        let ext = serde_json::json!({"oplock_level": "batch"});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::Exclusive));
+
+        // Lease string
+        let ext = serde_json::json!({"oplock_level": "lease"});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::Lease));
+    }
+
+    #[test]
+    fn test_parse_oplock_level_numeric() {
+        // MS-SMB2 2.2.14 numeric values
+        let ext = serde_json::json!({"oplock_level": 0});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::None));
+
+        let ext = serde_json::json!({"oplock_level": 2});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::II));
+
+        let ext = serde_json::json!({"oplock_level": 8});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::Exclusive));
+
+        let ext = serde_json::json!({"oplock_level": 9});
+        assert_eq!(parse_oplock_level(&ext), Some(smb::OplockLevel::Lease));
+
+        let ext = serde_json::json!({"oplock_level": 99});
+        assert_eq!(parse_oplock_level(&ext), None);
     }
 
     #[test]
@@ -809,6 +914,59 @@ mod tests {
     #[test]
     fn test_parse_create_disposition() {
         let ext = serde_json::json!({"create_disposition": "open_if"});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::OpenIf)
+        );
+    }
+
+    #[test]
+    fn test_parse_create_disposition_numeric() {
+        // MS-SMB2 2.2.13 numeric values
+        let ext = serde_json::json!({"create_disposition": 0});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::Superseded)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 1});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::Open)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 2});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::Create)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 3});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::OpenIf)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 4});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::Overwrite)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 5});
+        assert_eq!(
+            parse_create_disposition(&ext),
+            Some(smb::CreateDisposition::OverwriteIf)
+        );
+
+        let ext = serde_json::json!({"create_disposition": 99});
+        assert_eq!(parse_create_disposition(&ext), None);
+    }
+
+    #[test]
+    fn test_parse_create_disposition_string_numeric() {
+        // Numeric strings should also work
+        let ext = serde_json::json!({"create_disposition": "3"});
         assert_eq!(
             parse_create_disposition(&ext),
             Some(smb::CreateDisposition::OpenIf)

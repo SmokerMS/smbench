@@ -70,6 +70,18 @@ pub enum Operation {
         timestamp_us: u64,
         path: String,
     },
+    Mkdir {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        path: String,
+    },
+    Rmdir {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -87,7 +99,9 @@ impl Operation {
             | Operation::Write { op_id, .. }
             | Operation::Close { op_id, .. }
             | Operation::Rename { op_id, .. }
-            | Operation::Delete { op_id, .. } => op_id,
+            | Operation::Delete { op_id, .. }
+            | Operation::Mkdir { op_id, .. }
+            | Operation::Rmdir { op_id, .. } => op_id,
         }
     }
 
@@ -98,7 +112,9 @@ impl Operation {
             | Operation::Write { client_id, .. }
             | Operation::Close { client_id, .. }
             | Operation::Rename { client_id, .. }
-            | Operation::Delete { client_id, .. } => client_id,
+            | Operation::Delete { client_id, .. }
+            | Operation::Mkdir { client_id, .. }
+            | Operation::Rmdir { client_id, .. } => client_id,
         }
     }
 
@@ -109,7 +125,9 @@ impl Operation {
             | Operation::Write { timestamp_us, .. }
             | Operation::Close { timestamp_us, .. }
             | Operation::Rename { timestamp_us, .. }
-            | Operation::Delete { timestamp_us, .. } => *timestamp_us,
+            | Operation::Delete { timestamp_us, .. }
+            | Operation::Mkdir { timestamp_us, .. }
+            | Operation::Rmdir { timestamp_us, .. } => *timestamp_us,
         }
     }
 
@@ -119,7 +137,10 @@ impl Operation {
             | Operation::Read { handle_ref, .. }
             | Operation::Write { handle_ref, .. }
             | Operation::Close { handle_ref, .. } => Some(handle_ref),
-            Operation::Rename { .. } | Operation::Delete { .. } => None,
+            Operation::Rename { .. }
+            | Operation::Delete { .. }
+            | Operation::Mkdir { .. }
+            | Operation::Rmdir { .. } => None,
         }
     }
 
@@ -141,6 +162,8 @@ pub struct WorkloadSummary {
     pub close_ops: usize,
     pub rename_ops: usize,
     pub delete_ops: usize,
+    pub mkdir_ops: usize,
+    pub rmdir_ops: usize,
 }
 
 impl WorkloadIr {
@@ -190,6 +213,8 @@ impl WorkloadIr {
             close_ops: 0,
             rename_ops: 0,
             delete_ops: 0,
+            mkdir_ops: 0,
+            rmdir_ops: 0,
         };
         for op in &self.operations {
             match op {
@@ -199,6 +224,8 @@ impl WorkloadIr {
                 Operation::Close { .. } => summary.close_ops += 1,
                 Operation::Rename { .. } => summary.rename_ops += 1,
                 Operation::Delete { .. } => summary.delete_ops += 1,
+                Operation::Mkdir { .. } => summary.mkdir_ops += 1,
+                Operation::Rmdir { .. } => summary.rmdir_ops += 1,
             }
         }
         summary

@@ -17,6 +17,8 @@ smb = { path = "vendor/smb-rs/crates/smb", optional = true }
 pcap-parser = { version = "0.15", optional = true }
 nom = { version = "7.1", optional = true }
 blake3 = { version = "1.8", optional = true }
+# Impacket backend dependencies
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -32,3 +34,4 @@ tokio-util = "0.7"
 default = []
 smb-rs-backend = ["smb"]
 pcap-compiler = ["pcap-parser", "nom", "blake3"]
+impacket-backend = ["base64"]
