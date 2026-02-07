@@ -1,8 +1,8 @@
-# SMBench Architecture: Current Implementation (v1.2.1)
+# SMBench Architecture: Current Implementation (v1.3.0)
 
 **Status:** PRIMARY ARCHITECTURE DOCUMENT  
-**Last Updated:** 2026-02-03  
-**Implementation:** Rust-only, smb-rs backend
+**Last Updated:** 2026-02-07  
+**Implementation:** Rust-only, smb-rs backend, PCAP compiler
 
 ---
 
@@ -14,8 +14,9 @@
 4. [IR Schema](#ir-schema)
 5. [Scheduler Design](#scheduler-design)
 6. [Backend Abstraction](#backend-abstraction)
-7. [Testing Strategy](#testing-strategy)
-8. [Future Roadmap](#future-roadmap)
+7. [PCAP Compiler](#pcap-compiler)
+8. [Testing Strategy](#testing-strategy)
+9. [Future Roadmap](#future-roadmap)
 
 ---
 
@@ -23,23 +24,23 @@
 
 SMBench is a high-fidelity SMB workload replay system implemented in Rust. It enables:
 
-- **Bug Reproduction:** Capture customer workloads → Replay in lab → Reproduce issues
+- **Bug Reproduction:** Capture customer workloads → Compile PCAP → Replay in lab → Reproduce issues
 - **Load Testing:** Scale to thousands of concurrent users with realistic timing
 - **Protocol Validation:** Test SMB2/3 feature compliance against real servers
 
 ### Current Capabilities
 
-✅ **Implemented:**
+**Implemented:**
+- PCAP compiler (`smbench compile`) with TCP reassembly, SMB2/3 parsing, and blob storage
 - Rust-based IR (Intermediate Representation) schema
 - Event-driven scheduler with per-client ordering
 - smb-rs backend with full SMB3 protocol support
-- Comprehensive test suite (45+ validation tests)
-- CLI tool (`smbench replay`)
+- Comprehensive test suite (80+ tests)
+- CLI tool (`smbench compile`, `smbench run`, `smbench validate`)
 
-❌ **Not Yet Implemented:**
-- PCAP compiler (planned for Phase 6)
+**Not Yet Implemented:**
 - Provisioning tools (AD/LDAP integration)
-- Path/user mapping for customer → lab translation
+- Path/user mapping for customer to lab translation
 - Analysis tools for PCAP comparison
 
 ---
@@ -48,24 +49,27 @@ SMBench is a high-fidelity SMB workload replay system implemented in Rust. It en
 
 ```mermaid
 graph LR
-    PCAP[PCAP File] -.->|Future| Compiler[PCAP Compiler]
-    Compiler -.->|Future| IR[WorkloadIr JSON]
-    IR -->|smbench replay| Scheduler[Scheduler]
+    PCAP[PCAP File] -->|smbench compile| Compiler[PCAP Compiler]
+    Compiler --> IR[WorkloadIr JSON]
+    IR -->|smbench run| Scheduler[Scheduler]
     Scheduler --> Backend[SMB Backend]
     Backend --> Server[SMB Server]
     
     Scheduler --> Observability[Observability]
     Observability --> Logs[Logs]
     Observability --> Metrics[Metrics]
+    
+    Compiler --> Blobs[Blob Storage]
 ```
 
 ### Data Flow
 
-1. **Input:** WorkloadIr JSON file (manually created or future PCAP compilation)
-2. **Scheduler:** Reads IR, schedules operations with timing fidelity
-3. **Backend:** Executes SMB operations via smb-rs
-4. **Observability:** Logs operations, collects metrics
-5. **Output:** Execution results, timing data, error reports
+1. **Input:** PCAP file compiled via `smbench compile`, or manually created WorkloadIr JSON
+2. **Compiler:** Reads PCAP, reassembles TCP, parses SMB2/3, extracts operations, writes IR + blobs
+3. **Scheduler:** Reads IR, schedules operations with timing fidelity
+4. **Backend:** Executes SMB operations via smb-rs
+5. **Observability:** Logs operations, collects metrics
+6. **Output:** Execution results, timing data, error reports
 
 ---
 
@@ -96,13 +100,9 @@ pub struct WorkloadIr {
 - `Open` - File/directory open with create options
 - `Close` - Close handle
 - `Read` - Read data from file
-- `Write` - Write data to file
+- `Write` - Write data to file (with content-addressed blob)
 - `Delete` - Delete file/directory
 - `Rename` - Rename file/directory
-- `Mkdir` - Create directory
-- `Rmdir` - Remove directory
-- `Fsctl` - File system control operations
-- `Ioctl` - I/O control operations
 
 ### 2. Scheduler
 
@@ -158,7 +158,6 @@ pub trait SMBBackend: Send + Sync {
 
 **Implementations:**
 - **smb-rs:** Full SMB2/3 protocol (current)
-- **Impacket:** Python-based (future)
 
 ### 4. smb-rs Backend
 
@@ -204,27 +203,27 @@ Rust-native SMB2/3 client implementation.
 {
   "version": 1,
   "metadata": {
-    "source": "manual | pcap_compiler",
+    "source": "pcap_compiler",
     "duration_seconds": 120.5,
     "client_count": 100
   },
   "clients": [
     {
-      "client_id": "user001",
+      "client_id": "10.0.0.1",
       "operation_count": 1500
     }
   ],
   "operations": [
     {
-      "op_id": "op_000001",
-      "client_id": "user001",
+      "type": "Open",
+      "op_id": "op_1",
+      "client_id": "10.0.0.1",
       "timestamp_us": 1000000,
-      "operation": "Open",
-      "path": "/share/file.txt",
-      "mode": "Write",
+      "path": "file.txt",
+      "mode": "ReadWrite",
       "handle_ref": "h_1",
       "extensions": {
-        "oplock_level": "Batch"
+        "create_disposition": 2
       }
     }
   ]
@@ -237,14 +236,13 @@ Rust-native SMB2/3 client implementation.
 
 ```json
 {
-  "operation": "Open",
-  "path": "/path/to/file",
+  "type": "Open",
+  "path": "path/to/file",
   "mode": "Read | Write | ReadWrite",
   "handle_ref": "h_1",
   "extensions": {
-    "create_disposition": "OpenIf",
-    "oplock_level": "Batch",
-    "file_attributes": {"archive": true}
+    "create_disposition": 2,
+    "oplock_level": 8
   }
 }
 ```
@@ -253,23 +251,11 @@ Rust-native SMB2/3 client implementation.
 
 ```json
 {
-  "operation": "Write",
+  "type": "Write",
   "handle_ref": "h_1",
   "offset": 0,
   "length": 4096,
-  "blob_path": "/tmp/blob_001.bin"
-}
-```
-
-#### Fsctl
-
-```json
-{
-  "operation": "Fsctl",
-  "handle_ref": "h_1",
-  "control_code": "SrvRequestResumeKey",
-  "input_blob_path": null,
-  "max_output_response": 4096
+  "blob_path": "blobs/a1b2c3d4e5f6.bin"
 }
 ```
 
@@ -312,8 +298,8 @@ sequenceDiagram
 **Example:**
 
 ```
-Client A: Open(t=0) → Write(t=100ms) → Close(t=200ms)
-Client B: Open(t=50ms) → Read(t=150ms) → Close(t=250ms)
+Client A: Open(t=0) -> Write(t=100ms) -> Close(t=200ms)
+Client B: Open(t=50ms) -> Read(t=150ms) -> Close(t=250ms)
 
 Execution timeline:
 t=0:    Client A Open starts
@@ -391,6 +377,69 @@ pub enum BackendError {
 
 ---
 
+## PCAP Compiler
+
+**Location:** `src/compiler/`  
+**Feature flag:** `pcap-compiler`
+
+The PCAP compiler extracts SMB2/3 operations from packet captures and generates
+WorkloadIr JSON with content-addressed blob files.
+
+### Pipeline
+
+```mermaid
+graph LR
+    PCAP[PCAP File] --> Reader[PcapReader]
+    Reader --> TCP[TcpReassembler]
+    TCP --> Parser[SmbParser]
+    Parser --> SM[StateMachine]
+    SM --> Extract[OperationExtractor]
+    Extract --> Gen[IrGenerator]
+    Gen --> IR[WorkloadIr JSON]
+    Gen --> Blobs[Blob Files]
+```
+
+### Components
+
+| Component | File | Description |
+|-----------|------|-------------|
+| **PcapReader** | `pcap_reader.rs` | Streams packets from PCAP files using `pcap-parser`. Handles Legacy PCAP format. |
+| **TcpReassembler** | `tcp_reassembly.rs` | Parses Ethernet/IPv4/IPv6/TCP headers, reassembles streams in sequence order, handles out-of-order packets and retransmissions. Filters for TCP port 445 (SMB). |
+| **SmbParser** | `smb_parser.rs` | `nom`-based parser for SMB2/3 messages. Parses 64-byte headers per [MS-SMB2 2.2.1] and command payloads for CREATE, CLOSE, READ, WRITE, IOCTL, SET_INFO, TREE_CONNECT, and more. Handles compound requests. |
+| **SmbStateMachine** | `state_machine.rs` | Tracks sessions, trees, and open files. Pairs requests with responses by message_id. Generates unique handle references. Per [MS-SMB2 Section 3]. |
+| **OperationExtractor** | `operation_extractor.rs` | Converts tracked operations to IR. Infers `OpenMode` from DesiredAccess mask. Extracts oplock/disposition metadata as extensions. |
+| **IrGenerator** | `ir_generator.rs` | Writes WorkloadIr JSON and content-addressed blob files. Uses BLAKE3 hashing for automatic deduplication. |
+
+### Key Design Decisions
+
+- **Stream merging:** Both TCP directions (client-to-server requests and server-to-client responses) are merged and sorted by `(message_id, is_response)` before state machine processing, ensuring correct request/response pairing.
+- **Content-addressed blobs:** Write data is hashed with BLAKE3 and stored in `blobs/{hash}.bin`. Identical writes across the capture share the same blob file.
+- **Multi-client support:** Each client IP is tracked independently. The compiler produces per-client operation sequences with proper handle references.
+
+### CLI Usage
+
+```bash
+smbench compile <pcap-file> [OPTIONS]
+  -o, --output <DIR>        Output directory (default: output)
+  --filter-client <IP>      Filter by client IP
+  --filter-share <NAME>     Filter by share name
+  --anonymize               Anonymize IPs/paths
+  -v, --verbose             Verbose output
+```
+
+### References
+
+- [MS-SMB2 2.2.1] SMB2 Packet Header
+- [MS-SMB2 2.2.13] CREATE Request
+- [MS-SMB2 2.2.14] CREATE Response
+- [MS-SMB2 2.2.19] READ Request
+- [MS-SMB2 2.2.21] WRITE Request
+- [MS-SMB2 2.2.39] SET_INFO Request
+- [MS-FSCC 2.4.34.2] FileRenameInformation
+- [RFC 793] TCP
+
+---
+
 ## Testing Strategy
 
 ### Test Pyramid
@@ -398,13 +447,13 @@ pub enum BackendError {
 ```
                     /\
                    /  \
-                  / E2E \          3 use case tests
+                  / E2E \          2 E2E tests + 3 use case tests
                  /______\
                 /        \
-               / Integration \     45 smb-rs validation tests
+               / Integration \     45 smb-rs + 11 compiler tests
               /______________\
              /                \
-            /   Unit Tests      \  (in src/)
+            /   Unit Tests      \  26 unit tests (in src/)
            /____________________\
 ```
 
@@ -414,6 +463,7 @@ pub enum BackendError {
 - IR parsing/serialization
 - Scheduler logic
 - Backend abstraction
+- PCAP compiler components (parser, reassembly, state machine, extractor, generator)
 
 #### 2. Integration Tests (tests/)
 
@@ -425,6 +475,19 @@ pub enum BackendError {
 - Multichannel capabilities
 - Directory operations
 - File/FS info queries
+
+**compiler_tests.rs** (11 tests):
+- PCAP reading and packet streaming
+- TCP reassembly (in-order, out-of-order, filtering)
+- SMB message parsing
+- State machine operation tracking
+- Operation extraction with type verification
+- Full pipeline (PCAP to IR) for single and multi-client
+- Blob storage and deduplication
+
+**e2e_pcap_to_replay.rs** (2 tests):
+- End-to-end single-client compile and validate
+- End-to-end multi-client compile and validate
 
 **backend_mode.rs:**
 - Development vs Production mode behavior
@@ -459,6 +522,9 @@ pub enum BackendError {
 # All tests (non-SMB)
 cargo test
 
+# PCAP compiler tests
+cargo test --features pcap-compiler
+
 # SMB backend tests (requires server)
 export SMBENCH_SMB_SERVER=10.10.10.79
 export SMBENCH_SMB_SHARE=testshare
@@ -478,34 +544,16 @@ cargo test --features smb-rs-backend test_oplock_break_race_condition -- --ignor
 
 ## Future Roadmap
 
-### Phase 6: PCAP Compiler (Planned)
-
-**Goal:** Extract SMB operations from PCAP files → Generate WorkloadIr
-
-**Components:**
-- PCAP reader (pcap-parser or pcap-rs)
-- TCP stream reassembly
-- SMB2/3 message parsing (reuse smb-msg crate)
-- Protocol state machine
-- Operation extraction
-- IR generation
-
-**Command:**
-```bash
-smbench compile capture.pcap -o workload.json
-smbench replay workload.json --server 10.10.10.79 --share testshare
-```
-
-### Phase 7: Provisioning Tools
+### Provisioning Tools
 
 **Goal:** Automate test environment setup
 
 - AD/LDAP user creation
 - Directory structure provisioning
 - Permission assignment
-- Path mapping (customer → lab)
+- Path mapping (customer to lab)
 
-### Phase 8: Analysis Tools
+### Analysis Tools
 
 **Goal:** Compare replay results to original PCAP
 
@@ -527,46 +575,66 @@ smbench replay workload.json --server 10.10.10.79 --share testshare
 - **[MS-PCCRC]** Peer Content Caching and Retrieval: Content Identification
   https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-pccrc/
 
-### Implementation Notes
+### Other
 
+- **[RFC 793]** Transmission Control Protocol
 - **smb-rs:** https://github.com/avivnaaman/smb-rs
 - **problem-definition.md:** Original requirements and use cases
-- **architecture-v1.2.2-locked.md:** Previous architecture (superseded)
 
 ---
 
 ## Appendix: CLI Usage
 
-### Replay Command
+### Compile Command
 
 ```bash
-smbench replay <IR_FILE> [OPTIONS]
+smbench compile <PCAP_FILE> [OPTIONS]
 
 Options:
-  --server <HOST>       SMB server hostname/IP
-  --share <SHARE>       Share name
-  --user <USER>         Username
-  --pass <PASS>         Password
-  --time-scale <SCALE>  Time scaling factor (default: 1.0)
-  --workers <N>         Worker threads (default: 4)
-  --max-concurrent <N>  Max concurrent operations (default: 100)
-  --validate-only       Validate IR without executing
+  -o, --output <DIR>        Output directory (default: output)
+  --filter-client <IP>      Only include traffic from/to this client IP
+  --filter-share <NAME>     Only include traffic for this share
+  --anonymize               Anonymize IPs and paths
+  -v, --verbose             Verbose logging
 ```
 
-### Example
+### Run Command
 
 ```bash
-# Replay workload at 10x speed
-smbench replay workload.json \
-  --server 10.10.10.79 \
-  --share testshare \
-  --user testuser \
-  --pass testpass \
-  --time-scale 0.1 \
-  --workers 8
+smbench run <IR_FILE>
+```
 
-# Validate IR only
-smbench replay workload.json --validate-only
+### Validate Command
+
+```bash
+smbench validate <IR_FILE>
+```
+
+### Legacy Mode
+
+```bash
+smbench --ir <IR_FILE> [OPTIONS]
+
+Options:
+  --backend <smb-rs>        Backend implementation
+  --time-scale <SCALE>      Time scaling factor (default: 1.0)
+  --workers <N>             Worker threads (default: 4)
+  --max-concurrent <N>      Max concurrent operations (default: 64)
+  --validate-only           Validate IR without executing
+  --dry-run                 Validate and print summary
+```
+
+### Example Workflow
+
+```bash
+# Compile PCAP to IR
+smbench compile customer.pcap -o workload/
+
+# Validate the generated IR
+smbench validate workload/workload.json
+
+# Replay (requires smb-rs-backend feature and env vars)
+smbench run workload/workload.json
 ```
 
 ---

@@ -1,8 +1,8 @@
 # SMBench Documentation Index
 
 **Project:** SMBench - SMB3 Workload Replay System  
-**Date:** February 1, 2026  
-**Status:** Architecture Complete, Ready for Implementation
+**Date:** February 7, 2026  
+**Status:** Core Implementation and PCAP Compiler Complete
 
 ---
 
@@ -43,7 +43,7 @@ SMBench: Capture PCAP → Compile to portable IR → Replay in lab with high fid
 
 ### The Architecture
 ```
-Python (PCAP Parser) → Workload IR (JSON) → Rust Engine (smb-rs + tokio) → SMB Server
+PCAP File → Rust Compiler (smbench compile) → Workload IR (JSON + Blobs) → Rust Engine (smb-rs + tokio) → SMB Server
 ```
 
 ### Why Rust?
@@ -87,9 +87,9 @@ Python (PCAP Parser) → Workload IR (JSON) → Rust Engine (smb-rs + tokio) →
 ### High-Level Design
 
 **Three-Phase System:**
-1. **Capture** - Python PCAP parser extracts SMB operations
-2. **Compile** - Convert to portable Workload IR (JSON + blobs)
-3. **Replay** - Rust engine executes with high fidelity
+1. **Capture** - Network capture of SMB traffic (PCAP files)
+2. **Compile** - Rust PCAP compiler extracts operations and converts to portable Workload IR (JSON + blobs) via `smbench compile`
+3. **Replay** - Rust engine executes with high fidelity via `smbench run`
 
 ### Key Innovations
 
@@ -202,9 +202,11 @@ Python (PCAP Parser) → Workload IR (JSON) → Rust Engine (smb-rs + tokio) →
 - **Platform:** Linux (Ubuntu 22.04+, Debian, RHEL 9+)
 
 ### Compiler
-- **Language:** Python 3.9+
-- **PCAP Parser:** Scapy or Pyshark
-- **TCP Reassembly:** dpkt
+- **Language:** Rust (same binary, `pcap-compiler` feature)
+- **PCAP Parsing:** pcap-parser
+- **SMB Parsing:** nom
+- **Blob Hashing:** BLAKE3
+- **TCP Reassembly:** Custom (IPv4/IPv6, out-of-order, retransmission handling)
 
 ### Deployment
 - **Container:** Docker (optional)
@@ -285,9 +287,9 @@ This is NOT a simple load generator - it's a high-fidelity replay system.
 5. 🔲 **Decision point:** Validate smb-rs or pivot
 
 ### Week 2
-1. 🔲 Build Python PCAP compiler (basic)
-2. 🔲 Generate first IR from real PCAP
-3. 🔲 Load IR in Rust
+1. ✅ Build Rust PCAP compiler (complete)
+2. ✅ Generate IR from PCAP with `smbench compile`
+3. ✅ Load IR in Rust
 4. 🔲 Execute 10 operations end-to-end
 5. 🔲 **Go/No-Go decision for Phase 1**
 
