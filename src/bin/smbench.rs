@@ -3,17 +3,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use smbench::backend::{BackendMode, SMBBackend};
 use smbench::ir::WorkloadIr;
 use smbench::scheduler::{InvariantMode, Scheduler, SchedulerConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "smbench", version, about = "SMBench CLI runner")]
+#[command(name = "smbench", version, about = "SMBench – SMB workload replay & analysis")]
 struct Cli {
-    /// Path to workload IR JSON
-    #[arg(long)]
-    ir: PathBuf,
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // ── Legacy flat-args mode (kept for backwards compatibility) ──
+
+    /// Path to workload IR JSON (for legacy run mode)
+    #[arg(long, global = false)]
+    ir: Option<PathBuf>,
 
     /// Backend implementation to use
     #[arg(long, value_enum, default_value = "smb-rs")]
@@ -64,6 +69,48 @@ struct Cli {
     log_json: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Compile a PCAP file into a WorkloadIr JSON (+ blob files)
+    #[cfg(feature = "pcap-compiler")]
+    Compile {
+        /// Path to the PCAP or PCAPNG file
+        pcap_file: PathBuf,
+
+        /// Output directory for workload.json and blobs/
+        #[arg(short, long, default_value = "output")]
+        output: PathBuf,
+
+        /// Only include traffic from/to this client IP
+        #[arg(long)]
+        filter_client: Option<String>,
+
+        /// Only include traffic for this share name
+        #[arg(long)]
+        filter_share: Option<String>,
+
+        /// Anonymize IPs and file paths in the output
+        #[arg(long, default_value_t = false)]
+        anonymize: bool,
+
+        /// Verbose logging
+        #[arg(short, long, default_value_t = false)]
+        verbose: bool,
+    },
+
+    /// Replay a WorkloadIr against an SMB server
+    Run {
+        /// Path to workload IR JSON
+        ir: PathBuf,
+    },
+
+    /// Validate a WorkloadIr JSON and print a summary
+    Validate {
+        /// Path to workload IR JSON
+        ir: PathBuf,
+    },
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum BackendChoice {
     SmbRs,
@@ -104,30 +151,99 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.log_json)?;
 
-    let ir_contents = fs::read_to_string(&cli.ir)?;
+    match cli.command {
+        #[cfg(feature = "pcap-compiler")]
+        Some(Commands::Compile {
+            pcap_file,
+            output,
+            filter_client,
+            filter_share,
+            anonymize,
+            verbose,
+        }) => {
+            let options = smbench::compiler::CompilerOptions {
+                filter_client,
+                filter_share,
+                anonymize,
+                verbose,
+            };
+            let compiler = smbench::compiler::PcapCompiler::with_options(
+                pcap_file.to_string_lossy().to_string(),
+                options,
+            )?;
+            let ir_path = compiler.compile(&output).await?;
+            println!("Compiled PCAP → {}", ir_path);
+        }
+
+        Some(Commands::Run { ref ir }) => {
+            run_workload(&cli, ir).await?;
+        }
+
+        Some(Commands::Validate { ref ir }) => {
+            let ir_contents = fs::read_to_string(&ir)?;
+            let workload: WorkloadIr = serde_json::from_str(&ir_contents)?;
+            workload.validate().map_err(|e| anyhow!(e))?;
+            let summary = workload.summary();
+            println!("IR validation OK");
+            println!(
+                "Clients: {} | Ops: {} (open {}, read {}, write {}, close {}, rename {}, delete {})",
+                summary.client_count,
+                summary.operation_count,
+                summary.open_ops,
+                summary.read_ops,
+                summary.write_ops,
+                summary.close_ops,
+                summary.rename_ops,
+                summary.delete_ops
+            );
+        }
+
+        None => {
+            // Legacy flat-args mode: require --ir
+            if let Some(ref ir_path) = cli.ir {
+                let ir_contents = fs::read_to_string(ir_path)?;
+                let ir: WorkloadIr = serde_json::from_str(&ir_contents)?;
+                ir.validate().map_err(|err| anyhow!(err))?;
+                let summary = ir.summary();
+
+                if cli.validate_only {
+                    println!("IR validation OK");
+                    return Ok(());
+                }
+                if cli.dry_run {
+                    println!("IR validation OK");
+                    println!(
+                        "Clients: {} | Ops: {} (open {}, read {}, write {}, close {}, rename {}, delete {})",
+                        summary.client_count,
+                        summary.operation_count,
+                        summary.open_ops,
+                        summary.read_ops,
+                        summary.write_ops,
+                        summary.close_ops,
+                        summary.rename_ops,
+                        summary.delete_ops
+                    );
+                    return Ok(());
+                }
+
+                run_workload(&cli, ir_path).await?;
+            } else {
+                eprintln!("Usage: smbench <COMMAND> or smbench --ir <path>");
+                eprintln!("  compile   Compile a PCAP file into WorkloadIr");
+                eprintln!("  run       Replay a WorkloadIr against an SMB server");
+                eprintln!("  validate  Validate a WorkloadIr JSON");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_workload(cli: &Cli, ir_path: &std::path::Path) -> Result<()> {
+    let ir_contents = fs::read_to_string(ir_path)?;
     let ir: WorkloadIr = serde_json::from_str(&ir_contents)?;
     ir.validate().map_err(|err| anyhow!(err))?;
-    let summary = ir.summary();
-
-    if cli.validate_only {
-        println!("IR validation OK");
-        return Ok(());
-    }
-    if cli.dry_run {
-        println!("IR validation OK");
-        println!(
-            "Clients: {} | Ops: {} (open {}, read {}, write {}, close {}, rename {}, delete {})",
-            summary.client_count,
-            summary.operation_count,
-            summary.open_ops,
-            summary.read_ops,
-            summary.write_ops,
-            summary.close_ops,
-            summary.rename_ops,
-            summary.delete_ops
-        );
-        return Ok(());
-    }
 
     let backend: Arc<dyn SMBBackend> = match cli.backend {
         BackendChoice::SmbRs => build_smb_rs_backend()?,

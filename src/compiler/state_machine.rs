@@ -1,90 +1,478 @@
-//! SMB protocol state machine
+//! SMB protocol state machine.
 //!
-//! Tracks connection state, session state, tree connections, and open files
-//! to properly pair requests/responses and extract operations.
+//! Tracks connections, sessions, tree connections and open files across
+//! request/response pairs. Each completed request→response pair generates
+//! a `TrackedOperation` that the downstream `OperationExtractor` converts
+//! into an IR `Operation`.
 //!
-//! Reference: [MS-SMB2] Section 3 - Protocol Details
+//! ## References
+//!
+//! - [MS-SMB2 3.2] Client-side protocol details (state machines)
+//! - [MS-SMB2 3.3] Server-side protocol details (state machines)
 
-use super::smb_parser::SmbMessage;
+use super::smb_parser::{FileId, SmbCommand, SmbMessage};
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// SMB connection state
+/// Global counter for generating unique handle references.
+static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_handle_ref() -> String {
+    let n = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("h_{}", n)
+}
+
+// ── public types ──
+
+/// Represents an SMB connection (identified by a client IP or equivalent).
 #[derive(Debug, Clone)]
 pub struct SmbConnection {
+    /// Identifier for the client (e.g. IP address).
     pub client_id: String,
+    /// Sessions within this connection.
     pub sessions: HashMap<u64, SessionState>,
+    /// All completed operations on this connection.
     pub operations: Vec<TrackedOperation>,
 }
 
-/// Session state
+/// Per-session state.
 #[derive(Debug, Clone)]
 pub struct SessionState {
     pub session_id: u64,
     pub trees: HashMap<u32, TreeState>,
 }
 
-/// Tree connection state
+/// Per-tree-connect state.
 #[derive(Debug, Clone)]
 pub struct TreeState {
     pub tree_id: u32,
     pub share_name: String,
-    pub open_files: HashMap<[u8; 16], FileState>,
+    pub open_files: HashMap<FileId, FileState>,
 }
 
-/// Open file state
+/// Per-open-file state.
 #[derive(Debug, Clone)]
 pub struct FileState {
-    pub file_id: [u8; 16],
+    pub file_id: FileId,
     pub path: String,
+    pub handle_ref: String,
     pub create_time_us: u64,
 }
 
-/// Tracked operation (request + response pair)
+/// A completed operation extracted from a request→response pair.
 #[derive(Debug, Clone)]
 pub struct TrackedOperation {
+    /// Microsecond timestamp of the *request*.
     pub timestamp_us: u64,
+    /// SMB operation type name (Open, Read, Write, Close, Rename, Delete, ...).
     pub operation_type: String,
-    pub file_id: Option<[u8; 16]>,
+    /// Client identifier.
+    pub client_id: String,
+    /// Associated file_id (if applicable).
+    pub file_id: Option<FileId>,
+    /// Handle reference for the IR.
+    pub handle_ref: Option<String>,
+    /// File / share path.
     pub path: Option<String>,
+    /// Read/Write offset.
     pub offset: Option<u64>,
+    /// Read/Write length.
     pub length: Option<u32>,
+    /// Write data (captured from the request).
     pub data: Option<Vec<u8>>,
+    /// DesiredAccess mask (for CREATE).
+    pub desired_access: Option<u32>,
+    /// CreateDisposition (for CREATE).
+    pub create_disposition: Option<u32>,
+    /// Oplock level.
+    pub oplock_level: Option<u8>,
+    /// Rename target path.
+    pub rename_target: Option<String>,
+    /// IOCTL control code.
+    pub ctl_code: Option<u32>,
 }
 
-/// SMB protocol state machine
+// ── state machine ──
+
+/// Pending request stored while waiting for the matching response.
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    message: SmbMessage,
+}
+
+/// The state machine that processes SMB messages in order and tracks
+/// sessions → trees → files.
 pub struct SmbStateMachine {
+    /// All tracked connections, keyed by client_id.
     connections: HashMap<String, SmbConnection>,
-    pending_requests: HashMap<u64, SmbMessage>,
+    /// Pending requests waiting for a response, keyed by (session_id, message_id).
+    pending: HashMap<(u64, u64), PendingRequest>,
+    /// Current client identifier (set per-stream).
+    current_client: String,
 }
 
 impl SmbStateMachine {
-    /// Create a new state machine
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
-            pending_requests: HashMap::new(),
+            pending: HashMap::new(),
+            current_client: String::new(),
         }
     }
 
-    /// Process an SMB message and update state
-    pub fn process_message(&mut self, _message: SmbMessage) -> Result<()> {
-        // TODO: Implement state machine logic
-        // 1. If request: Store in pending_requests
-        // 2. If response: Match with request, update state, extract operation
-        // 3. Track sessions, trees, file opens/closes
-        // 4. Generate TrackedOperation for each completed request/response pair
+    /// Set the current client identifier (call before feeding a stream's messages).
+    pub fn set_client_id(&mut self, client_id: impl Into<String>) {
+        self.current_client = client_id.into();
+    }
+
+    /// Process a single SMB message.
+    pub fn process_message(&mut self, message: SmbMessage) -> Result<()> {
+        let client_id = self.current_client.clone();
+
+        // Ensure the connection entry exists.
+        self.connections.entry(client_id.clone()).or_insert_with(|| SmbConnection {
+            client_id: client_id.clone(),
+            sessions: HashMap::new(),
+            operations: Vec::new(),
+        });
+
+        if message.is_response {
+            self.process_response(message, &client_id)?;
+        } else {
+            self.process_request(message, &client_id)?;
+        }
         Ok(())
     }
 
-    /// Finalize state machine and return all connections
+    fn process_request(&mut self, message: SmbMessage, _client_id: &str) -> Result<()> {
+        // For TreeConnect requests, extract the path before storing.
+        let key = (message.session_id, message.message_id);
+        self.pending.insert(key, PendingRequest { message });
+        Ok(())
+    }
+
+    fn process_response(&mut self, response: SmbMessage, client_id: &str) -> Result<()> {
+        let key = (response.session_id, response.message_id);
+        let request_opt = self.pending.remove(&key);
+
+        let conn = self.connections.get_mut(client_id).unwrap();
+
+        // Ensure session exists.
+        conn.sessions.entry(response.session_id).or_insert_with(|| SessionState {
+            session_id: response.session_id,
+            trees: HashMap::new(),
+        });
+
+        // Helper: successful responses have status 0 (STATUS_SUCCESS) or
+        // STATUS_BUFFER_OVERFLOW (0x80000005) for partial reads, etc.
+        let success = response.status == 0 || response.status == 0x80000005;
+
+        match (&response.command, request_opt) {
+            // ── TREE_CONNECT ──
+            (SmbCommand::TreeConnect { .. }, Some(req)) => {
+                if success {
+                    let path = match &req.message.command {
+                        SmbCommand::TreeConnect { path } => path.clone(),
+                        _ => String::new(),
+                    };
+                    let session = conn.sessions.get_mut(&response.session_id).unwrap();
+                    session.trees.entry(response.tree_id).or_insert_with(|| TreeState {
+                        tree_id: response.tree_id,
+                        share_name: path,
+                        open_files: HashMap::new(),
+                    });
+                }
+            }
+
+            // ── CREATE ──
+            (SmbCommand::Create(resp_params), Some(req)) => {
+                if success {
+                    let (req_path, desired_access, create_disposition, req_oplock) =
+                        match &req.message.command {
+                            SmbCommand::Create(p) => (
+                                p.path.clone(),
+                                p.desired_access,
+                                p.create_disposition,
+                                p.oplock_level,
+                            ),
+                            _ => (String::new(), 0, 0, 0),
+                        };
+
+                    let handle_ref = next_handle_ref();
+                    let file_state = FileState {
+                        file_id: resp_params.file_id,
+                        path: req_path.clone(),
+                        handle_ref: handle_ref.clone(),
+                        create_time_us: req.message.timestamp_us,
+                    };
+
+                    // Register the file in the tree.
+                    if let Some(session) = conn.sessions.get_mut(&response.session_id) {
+                        if let Some(tree) = session.trees.get_mut(&response.tree_id) {
+                            tree.open_files.insert(resp_params.file_id, file_state);
+                        }
+                    }
+
+                    conn.operations.push(TrackedOperation {
+                        timestamp_us: req.message.timestamp_us,
+                        operation_type: "Open".to_string(),
+                        client_id: client_id.to_string(),
+                        file_id: Some(resp_params.file_id),
+                        handle_ref: Some(handle_ref),
+                        path: Some(req_path),
+                        offset: None,
+                        length: None,
+                        data: None,
+                        desired_access: Some(desired_access),
+                        create_disposition: Some(create_disposition),
+                        oplock_level: Some(req_oplock),
+                        rename_target: None,
+                        ctl_code: None,
+                    });
+                }
+            }
+
+            // ── CLOSE ──
+            (SmbCommand::Close { file_id }, Some(req)) => {
+                let req_fid = match &req.message.command {
+                    SmbCommand::Close { file_id } => *file_id,
+                    _ => *file_id,
+                };
+                let (handle_ref, path) = lookup_file(
+                    conn, response.session_id, response.tree_id, &req_fid,
+                );
+
+                conn.operations.push(TrackedOperation {
+                    timestamp_us: req.message.timestamp_us,
+                    operation_type: "Close".to_string(),
+                    client_id: client_id.to_string(),
+                    file_id: Some(req_fid),
+                    handle_ref: Some(handle_ref),
+                    path,
+                    offset: None,
+                    length: None,
+                    data: None,
+                    desired_access: None,
+                    create_disposition: None,
+                    oplock_level: None,
+                    rename_target: None,
+                    ctl_code: None,
+                });
+
+                // Remove file from tree state.
+                if let Some(session) = conn.sessions.get_mut(&response.session_id) {
+                    if let Some(tree) = session.trees.get_mut(&response.tree_id) {
+                        tree.open_files.remove(&req_fid);
+                    }
+                }
+            }
+
+            // ── READ ──
+            (SmbCommand::Read { length: resp_len, .. }, Some(req)) => {
+                let (req_fid, req_offset, req_length) = match &req.message.command {
+                    SmbCommand::Read { file_id, offset, length } => (*file_id, *offset, *length),
+                    _ => ([0; 16], 0, *resp_len),
+                };
+                let (handle_ref, path) = lookup_file(
+                    conn, response.session_id, req.message.tree_id, &req_fid,
+                );
+                conn.operations.push(TrackedOperation {
+                    timestamp_us: req.message.timestamp_us,
+                    operation_type: "Read".to_string(),
+                    client_id: client_id.to_string(),
+                    file_id: Some(req_fid),
+                    handle_ref: Some(handle_ref),
+                    path,
+                    offset: Some(req_offset),
+                    length: Some(req_length),
+                    data: None,
+                    desired_access: None,
+                    create_disposition: None,
+                    oplock_level: None,
+                    rename_target: None,
+                    ctl_code: None,
+                });
+            }
+
+            // ── WRITE ──
+            (SmbCommand::Write { .. }, Some(req)) => {
+                let (req_fid, req_offset, req_length, req_data) = match &req.message.command {
+                    SmbCommand::Write { file_id, offset, length, data } => {
+                        (*file_id, *offset, *length, data.clone())
+                    }
+                    _ => ([0; 16], 0, 0, Vec::new()),
+                };
+                let (handle_ref, path) = lookup_file(
+                    conn, response.session_id, req.message.tree_id, &req_fid,
+                );
+                conn.operations.push(TrackedOperation {
+                    timestamp_us: req.message.timestamp_us,
+                    operation_type: "Write".to_string(),
+                    client_id: client_id.to_string(),
+                    file_id: Some(req_fid),
+                    handle_ref: Some(handle_ref),
+                    path,
+                    offset: Some(req_offset),
+                    length: Some(req_length),
+                    data: Some(req_data),
+                    desired_access: None,
+                    create_disposition: None,
+                    oplock_level: None,
+                    rename_target: None,
+                    ctl_code: None,
+                });
+            }
+
+            // ── SET_INFO (rename detection) ──
+            (SmbCommand::SetInfo(_), Some(req)) => {
+                if let SmbCommand::SetInfo(params) = &req.message.command {
+                    if params.info_type == 0x01 && params.file_info_class == 0x0A {
+                        // FileRenameInformation
+                        let (handle_ref, path) = lookup_file(
+                            conn, response.session_id, req.message.tree_id, &params.file_id,
+                        );
+                        conn.operations.push(TrackedOperation {
+                            timestamp_us: req.message.timestamp_us,
+                            operation_type: "Rename".to_string(),
+                            client_id: client_id.to_string(),
+                            file_id: Some(params.file_id),
+                            handle_ref: Some(handle_ref),
+                            path,
+                            offset: None,
+                            length: None,
+                            data: None,
+                            desired_access: None,
+                            create_disposition: None,
+                            oplock_level: None,
+                            rename_target: params.rename_target.clone(),
+                            ctl_code: None,
+                        });
+                    }
+                    // FileDispositionInformation (class 13/0x0D) → Delete
+                    if params.info_type == 0x01 && params.file_info_class == 0x0D {
+                        let (handle_ref, path) = lookup_file(
+                            conn, response.session_id, req.message.tree_id, &params.file_id,
+                        );
+                        conn.operations.push(TrackedOperation {
+                            timestamp_us: req.message.timestamp_us,
+                            operation_type: "Delete".to_string(),
+                            client_id: client_id.to_string(),
+                            file_id: Some(params.file_id),
+                            handle_ref: Some(handle_ref),
+                            path,
+                            offset: None,
+                            length: None,
+                            data: None,
+                            desired_access: None,
+                            create_disposition: None,
+                            oplock_level: None,
+                            rename_target: None,
+                            ctl_code: None,
+                        });
+                    }
+                }
+            }
+
+            // ── Everything else: no-op ──
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Consume the state machine and return all connections.
     pub fn finalize(self) -> Result<Vec<SmbConnection>> {
         Ok(self.connections.into_values().collect())
     }
 }
 
+/// Look up handle_ref and path for a file_id in the connection's tree state.
+fn lookup_file(
+    conn: &SmbConnection,
+    session_id: u64,
+    tree_id: u32,
+    file_id: &FileId,
+) -> (String, Option<String>) {
+    if let Some(session) = conn.sessions.get(&session_id) {
+        if let Some(tree) = session.trees.get(&tree_id) {
+            if let Some(fs) = tree.open_files.get(file_id) {
+                return (fs.handle_ref.clone(), Some(fs.path.clone()));
+            }
+        }
+    }
+    // Unknown file; generate a synthetic handle_ref.
+    (next_handle_ref(), None)
+}
+
 impl Default for SmbStateMachine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::smb_parser::{SmbCommand, SmbMessage, CreateParams};
+
+    fn make_msg(
+        message_id: u64,
+        session_id: u64,
+        tree_id: u32,
+        command: SmbCommand,
+        is_response: bool,
+        status: u32,
+    ) -> SmbMessage {
+        SmbMessage {
+            timestamp_us: message_id * 1000,
+            message_id,
+            session_id,
+            tree_id,
+            command,
+            is_response,
+            status,
+        }
+    }
+
+    #[test]
+    fn test_create_close_tracking() {
+        let mut sm = SmbStateMachine::new();
+        sm.set_client_id("10.0.0.1");
+
+        // Tree connect
+        sm.process_message(make_msg(1, 1, 0, SmbCommand::TreeConnect { path: "\\\\srv\\share".to_string() }, false, 0)).unwrap();
+        sm.process_message(make_msg(1, 1, 100, SmbCommand::TreeConnect { path: String::new() }, true, 0)).unwrap();
+
+        // Create request
+        sm.process_message(make_msg(2, 1, 100, SmbCommand::Create(CreateParams {
+            file_id: [0; 16],
+            path: "test.txt".to_string(),
+            desired_access: 0x0012_0089, // GENERIC_READ
+            create_disposition: 1, // FILE_OPEN
+            oplock_level: 0,
+        }), false, 0)).unwrap();
+
+        // Create response
+        let fid = [1u8; 16];
+        sm.process_message(make_msg(2, 1, 100, SmbCommand::Create(CreateParams {
+            file_id: fid,
+            path: String::new(),
+            desired_access: 0,
+            create_disposition: 0,
+            oplock_level: 0,
+        }), true, 0)).unwrap();
+
+        // Close request
+        sm.process_message(make_msg(3, 1, 100, SmbCommand::Close { file_id: fid }, false, 0)).unwrap();
+        sm.process_message(make_msg(3, 1, 100, SmbCommand::Close { file_id: fid }, true, 0)).unwrap();
+
+        let conns = sm.finalize().unwrap();
+        assert_eq!(conns.len(), 1);
+        let ops = &conns[0].operations;
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].operation_type, "Open");
+        assert_eq!(ops[0].path.as_deref(), Some("test.txt"));
+        assert_eq!(ops[1].operation_type, "Close");
     }
 }

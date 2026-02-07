@@ -1,65 +1,207 @@
-//! Operation extraction from SMB state machine
+//! Operation extraction – converts `TrackedOperation` records from the
+//! state machine into IR `Operation` values.
 //!
-//! Converts tracked SMB operations to IR operations
+//! ## Mapping
+//!
+//! | SMB2 Command            | IR Operation |
+//! |-------------------------|-------------|
+//! | CREATE (success)        | `Open`      |
+//! | CLOSE                   | `Close`     |
+//! | READ                    | `Read`      |
+//! | WRITE                   | `Write`     |
+//! | SET_INFO (rename)       | `Rename`    |
+//! | SET_INFO (delete)       | `Delete`    |
 
 use super::state_machine::{SmbConnection, TrackedOperation};
-use crate::ir::Operation;
+use crate::ir::{OpenMode, Operation};
 use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Operation extractor
+static OP_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_op_id() -> String {
+    let n = OP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("op_{}", n)
+}
+
+/// Converts tracked SMB operations into IR operations.
 pub struct OperationExtractor;
 
 impl OperationExtractor {
-    /// Create a new operation extractor
     pub fn new() -> Self {
         Self
     }
 
-    /// Extract IR operations from SMB connections
+    /// Extract IR operations from all connections.
     pub fn extract(&self, connections: &[SmbConnection]) -> Result<Vec<Operation>> {
         let mut operations = Vec::new();
 
         for conn in connections {
-            for tracked_op in &conn.operations {
-                if let Some(ir_op) = self.convert_operation(&conn.client_id, tracked_op)? {
-                    operations.push(ir_op);
+            for tracked in &conn.operations {
+                if let Some(op) = self.convert(tracked)? {
+                    operations.push(op);
                 }
             }
         }
 
-        // Sort by timestamp
-        operations.sort_by_key(|op| match op {
-            Operation::Open { timestamp_us, .. } => *timestamp_us,
-            Operation::Close { timestamp_us, .. } => *timestamp_us,
-            Operation::Read { timestamp_us, .. } => *timestamp_us,
-            Operation::Write { timestamp_us, .. } => *timestamp_us,
-            Operation::Delete { timestamp_us, .. } => *timestamp_us,
-            Operation::Rename { timestamp_us, .. } => *timestamp_us,
-            Operation::Mkdir { timestamp_us, .. } => *timestamp_us,
-            Operation::Rmdir { timestamp_us, .. } => *timestamp_us,
-            Operation::Fsctl { timestamp_us, .. } => *timestamp_us,
-            Operation::Ioctl { timestamp_us, .. } => *timestamp_us,
-        });
-
+        // Sort by timestamp to produce a deterministic, chronological IR.
+        operations.sort_by_key(|op| op.timestamp_us());
         Ok(operations)
     }
 
-    fn convert_operation(
-        &self,
-        _client_id: &str,
-        _tracked_op: &TrackedOperation,
-    ) -> Result<Option<Operation>> {
-        // TODO: Implement operation conversion
-        // 1. Map SMB operations to IR operations
-        // 2. Generate unique op_id
-        // 3. Generate handle_ref for file operations
-        // 4. Extract blob data for Write operations
-        Ok(None)
+    fn convert(&self, t: &TrackedOperation) -> Result<Option<Operation>> {
+        let op = match t.operation_type.as_str() {
+            "Open" => {
+                let mode = infer_open_mode(t.desired_access.unwrap_or(0));
+                Operation::Open {
+                    op_id: next_op_id(),
+                    client_id: t.client_id.clone(),
+                    timestamp_us: t.timestamp_us,
+                    path: t.path.clone().unwrap_or_default(),
+                    mode,
+                    handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                    extensions: build_extensions(t),
+                }
+            }
+            "Close" => Operation::Close {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+            },
+            "Read" => Operation::Read {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                offset: t.offset.unwrap_or(0),
+                length: t.length.unwrap_or(0) as u64,
+            },
+            "Write" => Operation::Write {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                offset: t.offset.unwrap_or(0),
+                length: t.length.unwrap_or(0) as u64,
+                // blob_path is set later by the IrGenerator when it writes blob files.
+                blob_path: String::new(),
+            },
+            "Rename" => Operation::Rename {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                source_path: t.path.clone().unwrap_or_default(),
+                dest_path: t.rename_target.clone().unwrap_or_default(),
+            },
+            "Delete" => Operation::Delete {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                path: t.path.clone().unwrap_or_default(),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(op))
     }
 }
 
 impl Default for OperationExtractor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Infer `OpenMode` from the DesiredAccess mask.
+///
+/// [MS-SMB2 2.2.13] DesiredAccess bits:
+/// - FILE_READ_DATA  = 0x0000_0001
+/// - FILE_WRITE_DATA = 0x0000_0002
+/// - GENERIC_READ    = 0x8000_0000
+/// - GENERIC_WRITE   = 0x4000_0000
+fn infer_open_mode(access: u32) -> OpenMode {
+    let read = (access & 0x0000_0001) != 0 || (access & 0x8000_0000) != 0;
+    let write = (access & 0x0000_0002) != 0 || (access & 0x4000_0000) != 0;
+    match (read, write) {
+        (true, true) | (false, false) => OpenMode::ReadWrite,
+        (true, false) => OpenMode::Read,
+        (false, true) => OpenMode::Write,
+    }
+}
+
+/// Build optional JSON extensions from tracked operation metadata.
+fn build_extensions(t: &TrackedOperation) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(oplock) = t.oplock_level {
+        if oplock != 0 {
+            map.insert(
+                "oplock_level".to_string(),
+                serde_json::Value::Number(oplock.into()),
+            );
+        }
+    }
+    if let Some(disp) = t.create_disposition {
+        map.insert(
+            "create_disposition".to_string(),
+            serde_json::Value::Number(disp.into()),
+        );
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::state_machine::{SmbConnection, TrackedOperation};
+
+    fn make_tracked(op_type: &str, client: &str) -> TrackedOperation {
+        TrackedOperation {
+            timestamp_us: 1000,
+            operation_type: op_type.to_string(),
+            client_id: client.to_string(),
+            file_id: Some([0xAA; 16]),
+            handle_ref: Some("h_1".to_string()),
+            path: Some("test.txt".to_string()),
+            offset: Some(0),
+            length: Some(1024),
+            data: Some(vec![0x42; 1024]),
+            desired_access: Some(0x0012_0089),
+            create_disposition: Some(1),
+            oplock_level: Some(0),
+            rename_target: None,
+            ctl_code: None,
+        }
+    }
+
+    #[test]
+    fn test_extract_open() {
+        let conn = SmbConnection {
+            client_id: "10.0.0.1".to_string(),
+            sessions: Default::default(),
+            operations: vec![make_tracked("Open", "10.0.0.1")],
+        };
+        let extractor = OperationExtractor::new();
+        let ops = extractor.extract(&[conn]).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops[0], Operation::Open { .. }));
+    }
+
+    #[test]
+    fn test_infer_open_mode_read() {
+        assert!(matches!(infer_open_mode(0x0000_0001), OpenMode::Read));
+    }
+
+    #[test]
+    fn test_infer_open_mode_write() {
+        assert!(matches!(infer_open_mode(0x0000_0002), OpenMode::Write));
+    }
+
+    #[test]
+    fn test_infer_open_mode_readwrite() {
+        assert!(matches!(infer_open_mode(0x0000_0003), OpenMode::ReadWrite));
     }
 }

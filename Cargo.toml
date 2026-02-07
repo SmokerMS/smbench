@@ -16,6 +16,7 @@ smb = { path = "vendor/smb-rs/crates/smb", optional = true }
 # PCAP compiler dependencies
 pcap-parser = { version = "0.15", optional = true }
 nom = { version = "7.1", optional = true }
+blake3 = { version = "1.8", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -30,4 +31,4 @@ tokio-util = "0.7"
 [features]
 default = []
 smb-rs-backend = ["smb"]
-pcap-compiler = ["pcap-parser", "nom"]
+pcap-compiler = ["pcap-parser", "nom", "blake3"]
