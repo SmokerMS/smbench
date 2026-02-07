@@ -141,12 +141,24 @@ pub enum SmbCommand {
     QueryDirectory {
         file_id: FileId,
         pattern: String,
+        info_class: u8,
     },
     ChangeNotify {
         file_id: FileId,
+        filter: u32,
+        recursive: bool,
     },
     QueryInfo {
         file_id: FileId,
+        info_type: u8,
+        info_class: u8,
+    },
+    Flush {
+        file_id: FileId,
+    },
+    Lock {
+        file_id: FileId,
+        locks: Vec<LockElement>,
     },
     OplockBreak,
     /// Commands we don't parse in detail.
@@ -168,6 +180,8 @@ pub struct CreateParams {
     pub create_disposition: u32,
     /// Oplock level requested/granted.
     pub oplock_level: u8,
+    /// CreateOptions flags [MS-SMB2 2.2.13].
+    pub create_options: u32,
 }
 
 /// Parameters from SMB2_SET_INFO used to detect rename operations.
@@ -180,6 +194,15 @@ pub struct SetInfoParams {
     pub file_info_class: u8,
     /// If this is a FileRenameInformation (class 10 / 0x0A), the new name.
     pub rename_target: Option<String>,
+}
+
+/// A single lock element from an SMB2 LOCK request [MS-SMB2 2.2.26.1].
+#[derive(Debug, Clone)]
+pub struct LockElement {
+    pub offset: u64,
+    pub length: u64,
+    /// Flags: bit 0 = shared, bit 1 = exclusive, bit 2 = unlock, bit 3 = fail_immediately
+    pub flags: u32,
 }
 
 /// 16-byte SMB2 FileId [MS-SMB2 2.2.14.1].
@@ -395,26 +418,91 @@ impl SmbParser {
                     }))
                 }
             }
-            SmbCommandCode::QueryDirectory => {
-                if !is_response && payload.len() >= 32 {
+            SmbCommandCode::Flush => {
+                // [MS-SMB2 2.2.17] FLUSH Request: StructureSize(2) + Reserved1(2) + Reserved2(4) + FileId(16)
+                if !is_response && payload.len() >= 24 {
                     let fid = parse_file_id_at(payload, 8)?;
-                    // Pattern is at a variable offset; simplified extraction.
-                    Ok(SmbCommand::QueryDirectory { file_id: fid, pattern: "*".to_string() })
+                    Ok(SmbCommand::Flush { file_id: fid })
                 } else {
-                    Ok(SmbCommand::QueryDirectory { file_id: [0; 16], pattern: String::new() })
+                    Ok(SmbCommand::Flush { file_id: [0; 16] })
+                }
+            }
+            SmbCommandCode::Lock => {
+                // [MS-SMB2 2.2.26] LOCK Request
+                // StructureSize(2) + LockCount(2) + LockSequenceNumber/Index(4) + FileId(16) + Locks(variable)
+                if !is_response && payload.len() >= 24 {
+                    let lock_count = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+                    let fid = parse_file_id_at(payload, 8)?;
+                    let mut locks = Vec::with_capacity(lock_count);
+                    // Each LockElement is 24 bytes: Offset(8) + Length(8) + Flags(4) + Reserved(4)
+                    let locks_start = 24;
+                    for i in 0..lock_count {
+                        let base = locks_start + i * 24;
+                        if base + 24 > payload.len() { break; }
+                        let offset = u64::from_le_bytes([
+                            payload[base], payload[base+1], payload[base+2], payload[base+3],
+                            payload[base+4], payload[base+5], payload[base+6], payload[base+7],
+                        ]);
+                        let length = u64::from_le_bytes([
+                            payload[base+8], payload[base+9], payload[base+10], payload[base+11],
+                            payload[base+12], payload[base+13], payload[base+14], payload[base+15],
+                        ]);
+                        let flags = u32::from_le_bytes([
+                            payload[base+16], payload[base+17], payload[base+18], payload[base+19],
+                        ]);
+                        locks.push(LockElement { offset, length, flags });
+                    }
+                    Ok(SmbCommand::Lock { file_id: fid, locks })
+                } else {
+                    Ok(SmbCommand::Lock { file_id: [0; 16], locks: Vec::new() })
+                }
+            }
+            SmbCommandCode::QueryDirectory => {
+                // [MS-SMB2 2.2.33] QUERY_DIRECTORY Request
+                // StructureSize(2) + FileInformationClass(1) + Flags(1) + FileIndex(4)
+                // + FileId(16) + FileNameOffset(2) + FileNameLength(2) + OutputBufferLength(4)
+                if !is_response && payload.len() >= 32 {
+                    let info_class = payload[2];
+                    let fid = parse_file_id_at(payload, 8)?;
+                    let name_offset = u16::from_le_bytes([payload[24], payload[25]]) as usize;
+                    let name_length = u16::from_le_bytes([payload[26], payload[27]]) as usize;
+                    let adj = name_offset.saturating_sub(64);
+                    let pattern = if name_length > 0 && adj + name_length <= payload.len() {
+                        decode_utf16le(&payload[adj..adj + name_length]).unwrap_or_else(|| "*".to_string())
+                    } else {
+                        "*".to_string()
+                    };
+                    Ok(SmbCommand::QueryDirectory { file_id: fid, pattern, info_class })
+                } else {
+                    Ok(SmbCommand::QueryDirectory { file_id: [0; 16], pattern: String::new(), info_class: 0 })
                 }
             }
             SmbCommandCode::ChangeNotify => {
-                let fid = if payload.len() >= 24 {
-                    parse_file_id_at(payload, 8).unwrap_or([0; 16])
-                } else { [0; 16] };
-                Ok(SmbCommand::ChangeNotify { file_id: fid })
+                // [MS-SMB2 2.2.35] CHANGE_NOTIFY Request
+                // StructureSize(2) + Flags(2) + OutputBufferLength(4) + FileId(16) + CompletionFilter(4) + Reserved(4)
+                if !is_response && payload.len() >= 32 {
+                    let flags = u16::from_le_bytes([payload[2], payload[3]]);
+                    let recursive = (flags & 0x0001) != 0; // WATCH_TREE
+                    let fid = parse_file_id_at(payload, 8)?;
+                    let filter = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+                    Ok(SmbCommand::ChangeNotify { file_id: fid, filter, recursive })
+                } else {
+                    Ok(SmbCommand::ChangeNotify { file_id: [0; 16], filter: 0, recursive: false })
+                }
             }
             SmbCommandCode::QueryInfo => {
-                let fid = if !is_response && payload.len() >= 32 {
-                    parse_file_id_at(payload, 16).unwrap_or([0; 16])
-                } else { [0; 16] };
-                Ok(SmbCommand::QueryInfo { file_id: fid })
+                // [MS-SMB2 2.2.37] QUERY_INFO Request
+                // StructureSize(2) + InfoType(1) + FileInfoClass(1) + OutputBufferLength(4)
+                // + InputBufferOffset(2) + Reserved(2) + InputBufferLength(4) + AdditionalInformation(4)
+                // + Flags(4) + FileId(16)
+                if !is_response && payload.len() >= 40 {
+                    let info_type = payload[2];
+                    let info_class = payload[3];
+                    let fid = parse_file_id_at(payload, 24)?;
+                    Ok(SmbCommand::QueryInfo { file_id: fid, info_type, info_class })
+                } else {
+                    Ok(SmbCommand::QueryInfo { file_id: [0; 16], info_type: 0, info_class: 0 })
+                }
             }
             SmbCommandCode::OplockBreak => Ok(SmbCommand::OplockBreak),
             _ => Ok(SmbCommand::Other { code: code as u16 }),
@@ -512,11 +600,13 @@ fn parse_create_request(payload: &[u8]) -> Result<SmbCommand> {
             desired_access: 0,
             create_disposition: 0,
             oplock_level: 0,
+            create_options: 0,
         }));
     }
     let oplock_level = payload[3];
     let desired_access = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
     let create_disposition = u32::from_le_bytes([payload[36], payload[37], payload[38], payload[39]]);
+    let create_options = u32::from_le_bytes([payload[40], payload[41], payload[42], payload[43]]);
     let name_offset = u16::from_le_bytes([payload[44], payload[45]]) as usize;
     let name_length = u16::from_le_bytes([payload[46], payload[47]]) as usize;
 
@@ -534,6 +624,7 @@ fn parse_create_request(payload: &[u8]) -> Result<SmbCommand> {
         desired_access,
         create_disposition,
         oplock_level,
+        create_options,
     }))
 }
 
@@ -550,7 +641,8 @@ fn parse_create_response(payload: &[u8]) -> Result<SmbCommand> {
             path: String::new(),
             desired_access: 0,
             create_disposition: 0,
-            oplock_level: payload.first().map(|&b| b).unwrap_or(0),
+            oplock_level: payload.first().copied().unwrap_or(0),
+            create_options: 0,
         }));
     }
     let oplock_level = payload[2];
@@ -561,6 +653,7 @@ fn parse_create_response(payload: &[u8]) -> Result<SmbCommand> {
         desired_access: 0,
         create_disposition: 0,
         oplock_level,
+        create_options: 0,
     }))
 }
 

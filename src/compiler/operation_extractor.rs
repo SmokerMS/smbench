@@ -52,6 +52,31 @@ impl OperationExtractor {
     fn convert(&self, t: &TrackedOperation) -> Result<Option<Operation>> {
         let op = match t.operation_type.as_str() {
             "Open" => {
+                let create_options = t.create_options.unwrap_or(0);
+                let create_disposition = t.create_disposition.unwrap_or(0);
+                let is_directory = (create_options & 0x0000_0001) != 0; // FILE_DIRECTORY_FILE
+                let is_delete_on_close = (create_options & 0x0000_1000) != 0; // FILE_DELETE_ON_CLOSE
+
+                if is_directory && is_delete_on_close {
+                    // Directory opened with delete-on-close → Rmdir
+                    return Ok(Some(Operation::Rmdir {
+                        op_id: next_op_id(),
+                        client_id: t.client_id.clone(),
+                        timestamp_us: t.timestamp_us,
+                        path: t.path.clone().unwrap_or_default(),
+                    }));
+                }
+
+                if is_directory && (create_disposition == 2 || create_disposition == 3) {
+                    // FILE_CREATE (2) or FILE_OPEN_IF (3) on a directory → Mkdir
+                    return Ok(Some(Operation::Mkdir {
+                        op_id: next_op_id(),
+                        client_id: t.client_id.clone(),
+                        timestamp_us: t.timestamp_us,
+                        path: t.path.clone().unwrap_or_default(),
+                    }));
+                }
+
                 let mode = infer_open_mode(t.desired_access.unwrap_or(0));
                 Operation::Open {
                     op_id: next_op_id(),
@@ -99,6 +124,61 @@ impl OperationExtractor {
                 client_id: t.client_id.clone(),
                 timestamp_us: t.timestamp_us,
                 path: t.path.clone().unwrap_or_default(),
+            },
+            "QueryDirectory" => Operation::QueryDirectory {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                pattern: t.pattern.clone().unwrap_or_else(|| "*".to_string()),
+                info_class: t.info_class.unwrap_or(0),
+            },
+            "QueryInfo" => Operation::QueryInfo {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                info_type: t.info_type.unwrap_or(0),
+                info_class: t.info_class.unwrap_or(0),
+            },
+            "Flush" => Operation::Flush {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+            },
+            "Lock" => Operation::Lock {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                offset: t.lock_offset.unwrap_or(0),
+                length: t.lock_length.unwrap_or(0),
+                exclusive: t.lock_exclusive.unwrap_or(true),
+            },
+            "Unlock" => Operation::Unlock {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                offset: t.lock_offset.unwrap_or(0),
+                length: t.lock_length.unwrap_or(0),
+            },
+            "Ioctl" => Operation::Ioctl {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                ctl_code: t.ctl_code.unwrap_or(0),
+                input_blob_path: None,
+            },
+            "ChangeNotify" => Operation::ChangeNotify {
+                op_id: next_op_id(),
+                client_id: t.client_id.clone(),
+                timestamp_us: t.timestamp_us,
+                handle_ref: t.handle_ref.clone().unwrap_or_default(),
+                filter: t.notify_filter.unwrap_or(0),
+                recursive: t.notify_recursive.unwrap_or(false),
             },
             _ => return Ok(None),
         };
@@ -174,6 +254,15 @@ mod tests {
             oplock_level: Some(0),
             rename_target: None,
             ctl_code: None,
+            pattern: None,
+            info_class: None,
+            info_type: None,
+            lock_offset: None,
+            lock_length: None,
+            lock_exclusive: None,
+            notify_filter: None,
+            notify_recursive: None,
+            create_options: None,
         }
     }
 

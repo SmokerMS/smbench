@@ -290,6 +290,45 @@ impl SMBConnectionInner for ImpacketConnection {
                 let resp = w.request_response(&req).await?;
                 check_success_response(&resp, "Rmdir")
             }
+            Operation::QueryDirectory { handle_ref, pattern, info_class, .. } => {
+                let req = WorkerRequest::QueryDirectory {
+                    request_id: next_request_id(),
+                    handle_id: handle_ref.clone(),
+                    pattern: pattern.clone(),
+                    info_class: *info_class,
+                };
+                let resp = w.request_response(&req).await?;
+                check_success_response(&resp, "QueryDirectory")
+            }
+            Operation::QueryInfo { handle_ref, info_type, info_class, .. } => {
+                let req = WorkerRequest::QueryInfo {
+                    request_id: next_request_id(),
+                    handle_id: handle_ref.clone(),
+                    info_type: *info_type,
+                    info_class: *info_class,
+                };
+                let resp = w.request_response(&req).await?;
+                check_success_response(&resp, "QueryInfo")
+            }
+            Operation::Ioctl { handle_ref, ctl_code, .. } => {
+                let req = WorkerRequest::Ioctl {
+                    request_id: next_request_id(),
+                    handle_id: handle_ref.clone(),
+                    ctl_code: *ctl_code,
+                };
+                let resp = w.request_response(&req).await?;
+                check_success_response(&resp, "Ioctl")
+            }
+            Operation::ChangeNotify { handle_ref, filter, recursive, .. } => {
+                let req = WorkerRequest::ChangeNotify {
+                    request_id: next_request_id(),
+                    handle_id: handle_ref.clone(),
+                    filter: *filter,
+                    recursive: *recursive,
+                };
+                let resp = w.request_response(&req).await?;
+                check_success_response(&resp, "ChangeNotify")
+            }
             _ => Ok(()),
         }
     }
@@ -375,6 +414,41 @@ impl SMBFileHandle for ImpacketFileHandle {
         let resp = w.request_response(&req).await?;
         check_success_response(&resp, "Close")
     }
+
+    async fn flush(&self) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::Flush {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "Flush")
+    }
+
+    async fn lock(&self, offset: u64, length: u64, exclusive: bool) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::Lock {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            offset,
+            length,
+            exclusive,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "Lock")
+    }
+
+    async fn unlock(&self, offset: u64, length: u64) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::Unlock {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            offset,
+            length,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "Unlock")
+    }
 }
 
 fn check_success_response(resp: &WorkerResponse, operation: &str) -> Result<()> {
@@ -383,7 +457,14 @@ fn check_success_response(resp: &WorkerResponse, operation: &str) -> Result<()> 
         | WorkerResponse::Renamed { success, error, .. }
         | WorkerResponse::Deleted { success, error, .. }
         | WorkerResponse::MkdirResult { success, error, .. }
-        | WorkerResponse::RmdirResult { success, error, .. } => {
+        | WorkerResponse::RmdirResult { success, error, .. }
+        | WorkerResponse::QueryDirectoryResult { success, error, .. }
+        | WorkerResponse::QueryInfoResult { success, error, .. }
+        | WorkerResponse::FlushResult { success, error, .. }
+        | WorkerResponse::LockResult { success, error, .. }
+        | WorkerResponse::UnlockResult { success, error, .. }
+        | WorkerResponse::IoctlResult { success, error, .. }
+        | WorkerResponse::ChangeNotifyResult { success, error, .. } => {
             if !*success {
                 return Err(anyhow!(
                     "{} failed: {}",

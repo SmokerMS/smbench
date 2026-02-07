@@ -1,6 +1,7 @@
 use super::file_util::*;
 use super::*;
 use smb_fscc::FileStandardInformation;
+use smb_msg::lock::{LockElement, LockFlag, LockRequest, LockSequence};
 #[cfg(not(feature = "async"))]
 use std::io::prelude::*;
 use std::ops::{Deref, DerefMut};
@@ -239,6 +240,63 @@ impl File {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         log::debug!("Flushed {}.", self.handle.name());
+        Ok(())
+    }
+
+    /// Lock a byte range in the file.
+    ///
+    /// # Arguments
+    /// * `offset` - Starting offset of the range to lock.
+    /// * `length` - Length of the range to lock.
+    /// * `exclusive` - If true, acquire an exclusive lock; otherwise shared.
+    /// * `fail_immediately` - If true, fail immediately on conflict instead of waiting.
+    pub async fn lock(
+        &self,
+        offset: u64,
+        length: u64,
+        exclusive: bool,
+        fail_immediately: bool,
+    ) -> crate::Result<()> {
+        let mut flags = LockFlag::new();
+        if exclusive {
+            flags.set_exclusive(true);
+        } else {
+            flags.set_shared(true);
+        }
+        if fail_immediately {
+            flags.set_fail_immediately(true);
+        }
+        let element = LockElement::new(offset, length, flags);
+        let request = LockRequest {
+            lock_sequence: LockSequence::new(),
+            file_id: self.handle.file_id()?,
+            locks: vec![element],
+        };
+        let _response = self
+            .handle
+            .send_receive(request.into())
+            .await?;
+        Ok(())
+    }
+
+    /// Unlock a previously locked byte range.
+    ///
+    /// # Arguments
+    /// * `offset` - Starting offset of the range to unlock (must match lock range exactly).
+    /// * `length` - Length of the range to unlock (must match lock range exactly).
+    pub async fn unlock(&self, offset: u64, length: u64) -> crate::Result<()> {
+        let mut flags = LockFlag::new();
+        flags.set_unlock(true);
+        let element = LockElement::new(offset, length, flags);
+        let request = LockRequest {
+            lock_sequence: LockSequence::new(),
+            file_id: self.handle.file_id()?,
+            locks: vec![element],
+        };
+        let _response = self
+            .handle
+            .send_receive(request.into())
+            .await?;
         Ok(())
     }
 

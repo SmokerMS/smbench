@@ -144,6 +144,170 @@ async fn test_impacket_rename_delete() {
 }
 
 #[tokio::test]
+async fn test_impacket_flush_lock_unlock() {
+    let backend = ImpacketBackend::new(mock_config());
+    let mut conn = backend.connect("test_client").await.unwrap();
+
+    // Open a file first
+    let open_op = smbench::ir::Operation::Open {
+        op_id: "op_1".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 0,
+        path: "test/lockfile.bin".to_string(),
+        mode: OpenMode::ReadWrite,
+        handle_ref: "h_1".to_string(),
+        extensions: None,
+    };
+    conn.execute(&open_op).await.unwrap();
+
+    // Flush
+    let flush_op = smbench::ir::Operation::Flush {
+        op_id: "op_2".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 100,
+        handle_ref: "h_1".to_string(),
+    };
+    let result = conn.execute(&flush_op).await;
+    assert!(result.is_ok(), "Flush should succeed: {:?}", result.err());
+
+    // Lock
+    let lock_op = smbench::ir::Operation::Lock {
+        op_id: "op_3".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 200,
+        handle_ref: "h_1".to_string(),
+        offset: 0,
+        length: 1024,
+        exclusive: true,
+    };
+    let result = conn.execute(&lock_op).await;
+    assert!(result.is_ok(), "Lock should succeed: {:?}", result.err());
+
+    // Unlock
+    let unlock_op = smbench::ir::Operation::Unlock {
+        op_id: "op_4".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 300,
+        handle_ref: "h_1".to_string(),
+        offset: 0,
+        length: 1024,
+    };
+    let result = conn.execute(&unlock_op).await;
+    assert!(result.is_ok(), "Unlock should succeed: {:?}", result.err());
+
+    // Close
+    let close_op = smbench::ir::Operation::Close {
+        op_id: "op_5".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 400,
+        handle_ref: "h_1".to_string(),
+    };
+    conn.execute(&close_op).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_impacket_query_directory_info() {
+    let backend = ImpacketBackend::new(mock_config());
+    let mut conn = backend.connect("test_client").await.unwrap();
+
+    // Open a file first (acts as dir handle)
+    let open_op = smbench::ir::Operation::Open {
+        op_id: "op_1".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 0,
+        path: "test/dir".to_string(),
+        mode: OpenMode::Read,
+        handle_ref: "h_1".to_string(),
+        extensions: None,
+    };
+    conn.execute(&open_op).await.unwrap();
+
+    // QueryDirectory
+    let qd_op = smbench::ir::Operation::QueryDirectory {
+        op_id: "op_2".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 100,
+        handle_ref: "h_1".to_string(),
+        pattern: "*.txt".to_string(),
+        info_class: 37,
+    };
+    let result = conn.execute(&qd_op).await;
+    assert!(result.is_ok(), "QueryDirectory should succeed: {:?}", result.err());
+
+    // QueryInfo
+    let qi_op = smbench::ir::Operation::QueryInfo {
+        op_id: "op_3".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 200,
+        handle_ref: "h_1".to_string(),
+        info_type: 1,
+        info_class: 5,
+    };
+    let result = conn.execute(&qi_op).await;
+    assert!(result.is_ok(), "QueryInfo should succeed: {:?}", result.err());
+
+    // Close
+    let close_op = smbench::ir::Operation::Close {
+        op_id: "op_4".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 300,
+        handle_ref: "h_1".to_string(),
+    };
+    conn.execute(&close_op).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_impacket_ioctl_change_notify() {
+    let backend = ImpacketBackend::new(mock_config());
+    let mut conn = backend.connect("test_client").await.unwrap();
+
+    // Open a file first
+    let open_op = smbench::ir::Operation::Open {
+        op_id: "op_1".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 0,
+        path: "test/notify.txt".to_string(),
+        mode: OpenMode::ReadWrite,
+        handle_ref: "h_1".to_string(),
+        extensions: None,
+    };
+    conn.execute(&open_op).await.unwrap();
+
+    // Ioctl
+    let ioctl_op = smbench::ir::Operation::Ioctl {
+        op_id: "op_2".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 100,
+        handle_ref: "h_1".to_string(),
+        ctl_code: 0x00060194,
+        input_blob_path: None,
+    };
+    let result = conn.execute(&ioctl_op).await;
+    assert!(result.is_ok(), "Ioctl should succeed: {:?}", result.err());
+
+    // ChangeNotify
+    let cn_op = smbench::ir::Operation::ChangeNotify {
+        op_id: "op_3".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 200,
+        handle_ref: "h_1".to_string(),
+        filter: 0x17,
+        recursive: true,
+    };
+    let result = conn.execute(&cn_op).await;
+    assert!(result.is_ok(), "ChangeNotify should succeed: {:?}", result.err());
+
+    // Close
+    let close_op = smbench::ir::Operation::Close {
+        op_id: "op_4".to_string(),
+        client_id: "test_client".to_string(),
+        timestamp_us: 300,
+        handle_ref: "h_1".to_string(),
+    };
+    conn.execute(&close_op).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_impacket_capabilities() {
     let backend = ImpacketBackend::new(mock_config());
     let caps = backend.capabilities();

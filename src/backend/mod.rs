@@ -58,6 +58,15 @@ pub trait SMBFileHandle: Send + Sync {
     async fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>>;
     async fn write(&self, offset: u64, data: &[u8]) -> Result<u64>;
     async fn close(self: Box<Self>) -> Result<()>;
+    async fn flush(&self) -> Result<()> {
+        Ok(()) // Default: no-op (advisory)
+    }
+    async fn lock(&self, _offset: u64, _length: u64, _exclusive: bool) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
+    async fn unlock(&self, _offset: u64, _length: u64) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
     fn file_id(&self) -> Option<String> {
         None
     }
@@ -260,6 +269,48 @@ impl ConnectionState {
                     entry.handle.close().await?;
                 }
                 Ok(())
+            }
+            Operation::Flush { handle_ref, .. } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.flush().await
+            }
+            Operation::Lock {
+                handle_ref,
+                offset,
+                length,
+                exclusive,
+                ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.lock(*offset, *length, *exclusive).await
+            }
+            Operation::Unlock {
+                handle_ref,
+                offset,
+                length,
+                ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.unlock(*offset, *length).await
+            }
+            Operation::QueryDirectory { handle_ref, .. }
+            | Operation::QueryInfo { handle_ref, .. }
+            | Operation::Ioctl { handle_ref, .. }
+            | Operation::ChangeNotify { handle_ref, .. } => {
+                // Verify the handle exists, then delegate to backend-specific implementation.
+                if !self.handles.contains_key(handle_ref) {
+                    return Err(anyhow!("Unknown handle_ref: {}", handle_ref));
+                }
+                self.inner.execute_misc(op).await
             }
             _ => self.inner.execute_misc(op).await,
         }

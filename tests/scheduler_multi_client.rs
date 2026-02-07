@@ -551,3 +551,134 @@ async fn test_error_metrics_in_run_summary() {
     assert_eq!(summary.succeeded, 2);
     assert_eq!(summary.failed, 2);
 }
+
+/// Helper: build an IR with all 7 new operation types, each needing an open/close pair.
+fn build_ir_new_ops(client_id: &str) -> WorkloadIr {
+    let operations = vec![
+        Operation::Open {
+            op_id: "op_open".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 0,
+            path: "test/file.txt".to_string(),
+            mode: OpenMode::ReadWrite,
+            handle_ref: "h_1".to_string(),
+            extensions: None,
+        },
+        Operation::QueryDirectory {
+            op_id: "op_qd".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 1000,
+            handle_ref: "h_1".to_string(),
+            pattern: "*.txt".to_string(),
+            info_class: 37,
+        },
+        Operation::QueryInfo {
+            op_id: "op_qi".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 2000,
+            handle_ref: "h_1".to_string(),
+            info_type: 1,
+            info_class: 5,
+        },
+        Operation::Flush {
+            op_id: "op_fl".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 3000,
+            handle_ref: "h_1".to_string(),
+        },
+        Operation::Lock {
+            op_id: "op_lk".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 4000,
+            handle_ref: "h_1".to_string(),
+            offset: 0,
+            length: 1024,
+            exclusive: true,
+        },
+        Operation::Unlock {
+            op_id: "op_ul".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 5000,
+            handle_ref: "h_1".to_string(),
+            offset: 0,
+            length: 1024,
+        },
+        Operation::Ioctl {
+            op_id: "op_io".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 6000,
+            handle_ref: "h_1".to_string(),
+            ctl_code: 0x00060194,
+            input_blob_path: None,
+        },
+        Operation::ChangeNotify {
+            op_id: "op_cn".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 7000,
+            handle_ref: "h_1".to_string(),
+            filter: 0x17,
+            recursive: true,
+        },
+        Operation::Close {
+            op_id: "op_close".to_string(),
+            client_id: client_id.to_string(),
+            timestamp_us: 8000,
+            handle_ref: "h_1".to_string(),
+        },
+    ];
+
+    WorkloadIr {
+        version: 1,
+        metadata: Metadata {
+            source: "test_new_ops".to_string(),
+            duration_seconds: 0.01,
+            client_count: 1,
+        },
+        clients: vec![ClientSpec {
+            client_id: client_id.to_string(),
+            operation_count: operations.len() as u32,
+        }],
+        operations,
+    }
+}
+
+#[tokio::test]
+async fn test_new_ops_dispatch_through_scheduler() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(TrackingBackend {
+        delay: Duration::ZERO,
+        log: log.clone(),
+    });
+
+    let ir = build_ir_new_ops("c1");
+    let total_ops = ir.operations.len();
+
+    let scheduler = Scheduler::from_ir(
+        ir,
+        SchedulerConfig {
+            max_concurrent: 1,
+            time_scale: 0.001,
+            worker_count: 1,
+            ..default_config()
+        },
+    )
+    .unwrap();
+
+    let summary = scheduler.run(backend).await.unwrap();
+
+    assert_eq!(summary.dispatched, total_ops as u64);
+    assert_eq!(summary.succeeded, total_ops as u64);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.invariant_violations, 0);
+
+    // Verify all ops were logged in execute_misc
+    let log = log.lock().await;
+    // Open and Close go through different paths (open_simple / handle.close),
+    // and flush/lock/unlock go through handle methods, not execute_misc.
+    // QueryDirectory, QueryInfo, Ioctl, ChangeNotify should be logged via execute_misc.
+    let misc_ops: Vec<_> = log.iter().map(|(_, id)| id.as_str()).collect();
+    assert!(misc_ops.contains(&"op_qd"), "QueryDirectory should be dispatched");
+    assert!(misc_ops.contains(&"op_qi"), "QueryInfo should be dispatched");
+    assert!(misc_ops.contains(&"op_io"), "Ioctl should be dispatched");
+    assert!(misc_ops.contains(&"op_cn"), "ChangeNotify should be dispatched");
+}

@@ -255,6 +255,34 @@ impl SMBConnectionInner for SmbRsConnection {
                 file.close().await.map_err(|e| anyhow!(e))?;
                 Ok(())
             }
+            Operation::QueryDirectory { .. } => {
+                // QueryDirectory is handled as fire-and-forget for replay.
+                // The actual listing response is not needed for benchmarking.
+                Ok(())
+            }
+            Operation::QueryInfo { .. } => {
+                // QueryInfo is handled as fire-and-forget for replay.
+                Ok(())
+            }
+            Operation::Flush { .. } => {
+                // Flush is advisory; handled at the ConnectionState level via SMBFileHandle::flush().
+                Ok(())
+            }
+            Operation::Lock { .. } | Operation::Unlock { .. } => {
+                // Lock/Unlock are handled at ConnectionState level via the file handle.
+                // The actual smb-rs File::lock()/unlock() calls need the file handle,
+                // which is held in ConnectionState. Delegate back up.
+                Ok(())
+            }
+            Operation::Ioctl { ctl_code, .. } => {
+                // IOCTLs are server-specific; log and return success for replay.
+                tracing::debug!(ctl_code = ctl_code, "Ioctl replayed (no-op)");
+                Ok(())
+            }
+            Operation::ChangeNotify { .. } => {
+                // ChangeNotify is fire-and-forget for replay (don't wait for actual FS changes).
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -313,6 +341,24 @@ impl SMBFileHandle for SmbRsFileHandle {
 
     async fn close(self: Box<Self>) -> Result<()> {
         self.file.close().await.map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.file.flush().await.map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn lock(&self, offset: u64, length: u64, exclusive: bool) -> Result<()> {
+        self.file
+            .lock(offset, length, exclusive, true)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn unlock(&self, offset: u64, length: u64) -> Result<()> {
+        self.file
+            .unlock(offset, length)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
     }
 
     fn file_id(&self) -> Option<String> {

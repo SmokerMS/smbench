@@ -108,6 +108,62 @@ def main() -> None:
                 "error": None,
             })
 
+        elif msg_type == "QueryDirectory":
+            respond({
+                "type": "QueryDirectoryResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "QueryInfo":
+            respond({
+                "type": "QueryInfoResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "Flush":
+            respond({
+                "type": "FlushResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "Lock":
+            respond({
+                "type": "LockResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "Unlock":
+            respond({
+                "type": "UnlockResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "Ioctl":
+            respond({
+                "type": "IoctlResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
+        elif msg_type == "ChangeNotify":
+            respond({
+                "type": "ChangeNotifyResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
         elif msg_type == "Shutdown":
             break
 

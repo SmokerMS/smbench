@@ -74,6 +74,17 @@ pub struct LockFlag {
     __: B28,
 }
 
+impl LockElement {
+    /// Create a new LockElement with the given offset, length, and flags.
+    pub fn new(offset: u64, length: u64, flags: LockFlag) -> Self {
+        Self {
+            offset,
+            length,
+            flags,
+        }
+    }
+}
+
 /// SMB2 LOCK Response packet sent by the server in response to an SMB2 LOCK Request.
 ///
 /// Reference: MS-SMB2 2.2.27

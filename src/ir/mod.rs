@@ -82,6 +82,62 @@ pub enum Operation {
         timestamp_us: u64,
         path: String,
     },
+    QueryDirectory {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        pattern: String,
+        info_class: u8,
+    },
+    QueryInfo {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        info_type: u8,
+        info_class: u8,
+    },
+    Flush {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+    },
+    Lock {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        offset: u64,
+        length: u64,
+        exclusive: bool,
+    },
+    Unlock {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        offset: u64,
+        length: u64,
+    },
+    Ioctl {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        ctl_code: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_blob_path: Option<String>,
+    },
+    ChangeNotify {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        filter: u32,
+        recursive: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -101,7 +157,14 @@ impl Operation {
             | Operation::Rename { op_id, .. }
             | Operation::Delete { op_id, .. }
             | Operation::Mkdir { op_id, .. }
-            | Operation::Rmdir { op_id, .. } => op_id,
+            | Operation::Rmdir { op_id, .. }
+            | Operation::QueryDirectory { op_id, .. }
+            | Operation::QueryInfo { op_id, .. }
+            | Operation::Flush { op_id, .. }
+            | Operation::Lock { op_id, .. }
+            | Operation::Unlock { op_id, .. }
+            | Operation::Ioctl { op_id, .. }
+            | Operation::ChangeNotify { op_id, .. } => op_id,
         }
     }
 
@@ -114,7 +177,14 @@ impl Operation {
             | Operation::Rename { client_id, .. }
             | Operation::Delete { client_id, .. }
             | Operation::Mkdir { client_id, .. }
-            | Operation::Rmdir { client_id, .. } => client_id,
+            | Operation::Rmdir { client_id, .. }
+            | Operation::QueryDirectory { client_id, .. }
+            | Operation::QueryInfo { client_id, .. }
+            | Operation::Flush { client_id, .. }
+            | Operation::Lock { client_id, .. }
+            | Operation::Unlock { client_id, .. }
+            | Operation::Ioctl { client_id, .. }
+            | Operation::ChangeNotify { client_id, .. } => client_id,
         }
     }
 
@@ -127,7 +197,14 @@ impl Operation {
             | Operation::Rename { timestamp_us, .. }
             | Operation::Delete { timestamp_us, .. }
             | Operation::Mkdir { timestamp_us, .. }
-            | Operation::Rmdir { timestamp_us, .. } => *timestamp_us,
+            | Operation::Rmdir { timestamp_us, .. }
+            | Operation::QueryDirectory { timestamp_us, .. }
+            | Operation::QueryInfo { timestamp_us, .. }
+            | Operation::Flush { timestamp_us, .. }
+            | Operation::Lock { timestamp_us, .. }
+            | Operation::Unlock { timestamp_us, .. }
+            | Operation::Ioctl { timestamp_us, .. }
+            | Operation::ChangeNotify { timestamp_us, .. } => *timestamp_us,
         }
     }
 
@@ -136,7 +213,14 @@ impl Operation {
             Operation::Open { handle_ref, .. }
             | Operation::Read { handle_ref, .. }
             | Operation::Write { handle_ref, .. }
-            | Operation::Close { handle_ref, .. } => Some(handle_ref),
+            | Operation::Close { handle_ref, .. }
+            | Operation::QueryDirectory { handle_ref, .. }
+            | Operation::QueryInfo { handle_ref, .. }
+            | Operation::Flush { handle_ref, .. }
+            | Operation::Lock { handle_ref, .. }
+            | Operation::Unlock { handle_ref, .. }
+            | Operation::Ioctl { handle_ref, .. }
+            | Operation::ChangeNotify { handle_ref, .. } => Some(handle_ref),
             Operation::Rename { .. }
             | Operation::Delete { .. }
             | Operation::Mkdir { .. }
@@ -164,6 +248,13 @@ pub struct WorkloadSummary {
     pub delete_ops: usize,
     pub mkdir_ops: usize,
     pub rmdir_ops: usize,
+    pub query_directory_ops: usize,
+    pub query_info_ops: usize,
+    pub flush_ops: usize,
+    pub lock_ops: usize,
+    pub unlock_ops: usize,
+    pub ioctl_ops: usize,
+    pub change_notify_ops: usize,
 }
 
 impl WorkloadIr {
@@ -215,6 +306,13 @@ impl WorkloadIr {
             delete_ops: 0,
             mkdir_ops: 0,
             rmdir_ops: 0,
+            query_directory_ops: 0,
+            query_info_ops: 0,
+            flush_ops: 0,
+            lock_ops: 0,
+            unlock_ops: 0,
+            ioctl_ops: 0,
+            change_notify_ops: 0,
         };
         for op in &self.operations {
             match op {
@@ -226,6 +324,13 @@ impl WorkloadIr {
                 Operation::Delete { .. } => summary.delete_ops += 1,
                 Operation::Mkdir { .. } => summary.mkdir_ops += 1,
                 Operation::Rmdir { .. } => summary.rmdir_ops += 1,
+                Operation::QueryDirectory { .. } => summary.query_directory_ops += 1,
+                Operation::QueryInfo { .. } => summary.query_info_ops += 1,
+                Operation::Flush { .. } => summary.flush_ops += 1,
+                Operation::Lock { .. } => summary.lock_ops += 1,
+                Operation::Unlock { .. } => summary.unlock_ops += 1,
+                Operation::Ioctl { .. } => summary.ioctl_ops += 1,
+                Operation::ChangeNotify { .. } => summary.change_notify_ops += 1,
             }
         }
         summary
@@ -257,6 +362,106 @@ mod tests {
             }],
         };
         assert!(ir.validate().is_ok());
+    }
+
+    #[test]
+    fn test_new_ops_round_trip() {
+        let ops = vec![
+            Operation::QueryDirectory {
+                op_id: "qd_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 1000,
+                handle_ref: "h_1".to_string(),
+                pattern: "*.txt".to_string(),
+                info_class: 37,
+            },
+            Operation::QueryInfo {
+                op_id: "qi_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 2000,
+                handle_ref: "h_1".to_string(),
+                info_type: 1,
+                info_class: 5,
+            },
+            Operation::Flush {
+                op_id: "fl_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 3000,
+                handle_ref: "h_1".to_string(),
+            },
+            Operation::Lock {
+                op_id: "lk_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 4000,
+                handle_ref: "h_1".to_string(),
+                offset: 0,
+                length: 1024,
+                exclusive: true,
+            },
+            Operation::Unlock {
+                op_id: "ul_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 5000,
+                handle_ref: "h_1".to_string(),
+                offset: 0,
+                length: 1024,
+            },
+            Operation::Ioctl {
+                op_id: "io_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 6000,
+                handle_ref: "h_1".to_string(),
+                ctl_code: 0x00060194,
+                input_blob_path: None,
+            },
+            Operation::ChangeNotify {
+                op_id: "cn_1".to_string(),
+                client_id: "c1".to_string(),
+                timestamp_us: 7000,
+                handle_ref: "h_1".to_string(),
+                filter: 0x17,
+                recursive: true,
+            },
+        ];
+
+        let ir = WorkloadIr {
+            version: 1,
+            metadata: Metadata {
+                source: "test".to_string(),
+                duration_seconds: 1.0,
+                client_count: 1,
+            },
+            clients: vec![ClientSpec {
+                client_id: "c1".to_string(),
+                operation_count: 7,
+            }],
+            operations: ops,
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string_pretty(&ir).unwrap();
+        let ir2: WorkloadIr = serde_json::from_str(&json).unwrap();
+
+        assert!(ir2.validate().is_ok());
+        assert_eq!(ir2.operations.len(), 7);
+
+        // Verify summary
+        let summary = ir2.summary();
+        assert_eq!(summary.query_directory_ops, 1);
+        assert_eq!(summary.query_info_ops, 1);
+        assert_eq!(summary.flush_ops, 1);
+        assert_eq!(summary.lock_ops, 1);
+        assert_eq!(summary.unlock_ops, 1);
+        assert_eq!(summary.ioctl_ops, 1);
+        assert_eq!(summary.change_notify_ops, 1);
+
+        // Verify accessor methods
+        assert_eq!(ir2.operations[0].op_id(), "qd_1");
+        assert_eq!(ir2.operations[0].client_id(), "c1");
+        assert_eq!(ir2.operations[0].timestamp_us(), 1000);
+        assert_eq!(ir2.operations[0].handle_ref(), Some("h_1"));
+        assert_eq!(ir2.operations[3].handle_ref(), Some("h_1"));
+        assert_eq!(ir2.operations[5].handle_ref(), Some("h_1"));
     }
 
     #[test]
