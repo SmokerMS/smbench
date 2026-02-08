@@ -67,6 +67,21 @@ pub trait SMBFileHandle: Send + Sync {
     async fn unlock(&self, _offset: u64, _length: u64) -> Result<()> {
         Ok(()) // Default: no-op
     }
+    async fn query_directory(&self, _pattern: &str, _info_class: u8) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
+    async fn query_info(&self, _info_type: u8, _info_class: u8) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
+    async fn ioctl(&self, _ctl_code: u32) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
+    async fn change_notify(&self, _filter: u32, _recursive: bool) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
+    async fn set_info(&self, _info_type: u8, _info_class: u8) -> Result<()> {
+        Ok(()) // Default: no-op
+    }
     fn file_id(&self) -> Option<String> {
         None
     }
@@ -302,15 +317,84 @@ impl ConnectionState {
                     .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
                 entry.handle.unlock(*offset, *length).await
             }
-            Operation::QueryDirectory { handle_ref, .. }
-            | Operation::QueryInfo { handle_ref, .. }
-            | Operation::Ioctl { handle_ref, .. }
-            | Operation::ChangeNotify { handle_ref, .. } => {
-                // Verify the handle exists, then delegate to backend-specific implementation.
-                if !self.handles.contains_key(handle_ref) {
-                    return Err(anyhow!("Unknown handle_ref: {}", handle_ref));
+            Operation::QueryDirectory {
+                handle_ref, pattern, info_class, ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.query_directory(pattern, *info_class).await
+            }
+            Operation::QueryInfo {
+                handle_ref, info_type, info_class, ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.query_info(*info_type, *info_class).await
+            }
+            Operation::Ioctl {
+                handle_ref, ctl_code, ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.ioctl(*ctl_code).await
+            }
+            Operation::ChangeNotify {
+                handle_ref, filter, recursive, ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.change_notify(*filter, *recursive).await
+            }
+            Operation::SetInfo {
+                handle_ref, info_type, info_class, ..
+            } => {
+                let entry = self
+                    .handles
+                    .get(handle_ref)
+                    .ok_or_else(|| anyhow!("Unknown handle_ref: {}", handle_ref))?;
+                entry.handle.set_info(*info_type, *info_class).await
+            }
+            Operation::Echo { .. } | Operation::Cancel { .. } => {
+                // Echo and Cancel are connection-level operations, not file-level.
+                // They are replayed as no-ops since they serve as keep-alive / control.
+                Ok(())
+            }
+            Operation::OplockBreakAck { handle_ref, oplock_level, .. } => {
+                if let Some(entry) = self.handles.get(handle_ref) {
+                    let level = match oplock_level {
+                        0x00 => OplockLevel::None,
+                        0x02 => OplockLevel::Read,
+                        _ => OplockLevel::Batch,
+                    };
+                    entry.handle.acknowledge_oplock_break(level).await
+                } else {
+                    // Handle may have been closed already
+                    Ok(())
                 }
-                self.inner.execute_misc(op).await
+            }
+            Operation::TransactPipe { handle_ref, .. } => {
+                // TransactPipe goes through IOCTL with FSCTL_PIPE_TRANSACT
+                if let Some(entry) = self.handles.get(handle_ref) {
+                    entry.handle.ioctl(0x0011C017).await // FSCTL_PIPE_TRANSACT
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::ServerCopy { source_handle_ref, .. } => {
+                // Server-side copy requires resume key + copychunk IOCTLs.
+                // For now, verify the source handle exists and treat as no-op.
+                if !self.handles.contains_key(source_handle_ref) {
+                    tracing::debug!("ServerCopy source handle missing");
+                }
+                Ok(())
             }
             _ => self.inner.execute_misc(op).await,
         }

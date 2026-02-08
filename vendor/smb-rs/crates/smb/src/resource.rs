@@ -727,6 +727,85 @@ impl ResourceHandle {
         Ok(response.out_buffer)
     }
 
+    /// Sends a raw QUERY_INFO request with the standard `FileBasicInformation`
+    /// info class. Used for replaying captured traffic where the goal is to
+    /// generate equivalent I/O, not to parse the response.
+    pub async fn query_info_raw(&self) -> crate::Result<()> {
+        self.query_info::<FileBasicInformation>().await?;
+        Ok(())
+    }
+
+    /// Sends a raw QUERY_DIRECTORY request.
+    ///
+    /// This is a low-level method for replaying captured traffic. The response
+    /// body (directory listing) is discarded.
+    pub async fn query_directory_raw(
+        &self,
+        pattern: &str,
+    ) -> crate::Result<()> {
+        let buffer_length = self.calc_transact_size(None);
+        let req = QueryDirectoryRequest {
+            file_information_class: QueryDirectoryInfoClass::FileBothDirectoryInformation,
+            flags: QueryDirectoryFlags::new().with_restart_scans(true),
+            file_index: 0,
+            file_id: self.file_id()?,
+            output_buffer_length: buffer_length,
+            file_name: pattern.into(),
+        };
+        let result = self
+            .send_receive(req.into())
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(Error::UnexpectedMessageStatus(Status::U32_NO_MORE_FILES)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sends a raw CHANGE_NOTIFY request with a short timeout.
+    ///
+    /// Used for replaying captured traffic. Since the original filesystem
+    /// changes won't occur during replay, this uses a short timeout and
+    /// treats timeout/cancellation as success.
+    pub async fn change_notify_raw(
+        &self,
+        filter: u32,
+        recursive: bool,
+        timeout: std::time::Duration,
+    ) -> crate::Result<()> {
+        let buffer_length = self.calc_transact_size(None);
+        let notify_filter = NotifyFilter::from_bytes(filter.to_le_bytes());
+        let req = ChangeNotifyRequest {
+            file_id: self.file_id()?,
+            flags: NotifyFlags::new().with_watch_tree(recursive),
+            completion_filter: notify_filter,
+            output_buffer_length: buffer_length,
+        };
+        let result = self
+            .handler
+            .send_recvo(
+                req.into(),
+                ReceiveOptions::new()
+                    .with_allow_async(true)
+                    .with_timeout(timeout)
+                    .with_status(&[
+                        Status::Success,
+                        Status::Cancelled,
+                        Status::NotifyCleanup,
+                        Status::NotifyEnumDir,
+                    ]),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(Error::OperationTimeout(_)) => Ok(()), // Expected: no FS changes during replay
+            Err(Error::Cancelled(_)) => Ok(()),
+            Err(Error::UnexpectedMessageStatus(Status::U32_CANCELLED)) => Ok(()),
+            Err(Error::UnexpectedMessageStatus(Status::U32_NOTIFY_CLEANUP)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// (Internal)
     #[maybe_async]
     async fn _ioctl(

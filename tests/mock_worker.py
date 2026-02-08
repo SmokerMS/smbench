@@ -164,6 +164,14 @@ def main() -> None:
                 "error": None,
             })
 
+        elif msg_type == "SetInfo":
+            respond({
+                "type": "SetInfoResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+
         elif msg_type == "Shutdown":
             break
 

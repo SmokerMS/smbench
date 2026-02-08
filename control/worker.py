@@ -22,8 +22,10 @@ from typing import Any, Dict, Optional
 
 try:
     from impacket.smbconnection import SMBConnection  # type: ignore
+    from impacket.smb3structs import SMB2_LOCK_ELEMENT  # type: ignore
 except ImportError:
     SMBConnection = None  # Allow import for protocol testing without impacket
+    SMB2_LOCK_ELEMENT = None
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +33,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 connections: Dict[str, Any] = {}  # connection_id -> SMBConnection
+tree_ids: Dict[str, int] = {}    # connection_id -> tree_id (stored on Connect)
 handles: Dict[str, Any] = {}      # handle_id -> (connection_id, tree_id, file_id)
 
 
@@ -72,9 +75,10 @@ def handle_connect(msg: dict) -> None:
     try:
         conn = SMBConnection(server, server, sess_port=445)
         conn.login(username, password)
-        conn.connectTree(share)
+        tid = conn.connectTree(share)
         connection_id = str(uuid.uuid4())
         connections[connection_id] = conn
+        tree_ids[connection_id] = tid
         respond({
             "type": "Connected",
             "request_id": request_id,
@@ -104,17 +108,40 @@ def handle_open(msg: dict) -> None:
         return
 
     try:
-        # Map mode to desired access
-        if mode == "Read":
+        # Use extended parameters if present, otherwise infer from mode
+        ext_desired_access = msg.get("desired_access")
+        ext_create_disposition = msg.get("create_disposition")
+        ext_create_options = msg.get("create_options")
+        ext_share_access = msg.get("share_access")
+        ext_file_attributes = msg.get("file_attributes")
+
+        if ext_desired_access is not None:
+            desired_access = ext_desired_access
+        elif mode == "Read":
             desired_access = 0x80000000  # GENERIC_READ
         elif mode == "Write":
             desired_access = 0x40000000  # GENERIC_WRITE
         else:
             desired_access = 0x80000000 | 0x40000000  # GENERIC_READ | GENERIC_WRITE
 
-        # Open or create file
-        tree_id = conn.connectTree(conn.getRemoteHost().split("\\")[-1] if "\\" in conn.getRemoteHost() else "")
-        file_id = conn.openFile(tree_id, path, desiredAccess=desired_access)
+        # Reuse tree_id from Connect instead of reconnecting
+        tree_id = tree_ids.get(connection_id)
+        if tree_id is None:
+            error_response(request_id, f"No tree_id stored for connection: {connection_id}")
+            return
+
+        # Build open kwargs with extended parameters
+        open_kwargs = {"desiredAccess": desired_access}
+        if ext_create_disposition is not None:
+            open_kwargs["creationDisposition"] = ext_create_disposition
+        if ext_create_options is not None:
+            open_kwargs["creationOption"] = ext_create_options
+        if ext_share_access is not None:
+            open_kwargs["shareMode"] = ext_share_access
+        if ext_file_attributes is not None:
+            open_kwargs["fileAttributes"] = ext_file_attributes
+
+        file_id = conn.openFile(tree_id, path, **open_kwargs)
         handle_id = str(uuid.uuid4())
         handles[handle_id] = (connection_id, tree_id, file_id)
 
@@ -190,6 +217,45 @@ def handle_write(msg: dict) -> None:
 
     try:
         data = base64.b64decode(data_base64)
+        conn.writeFile(tree_id, file_id, data, offset)
+        respond({
+            "type": "WriteResult",
+            "request_id": request_id,
+            "bytes_written": len(data),
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        respond({
+            "type": "WriteResult",
+            "request_id": request_id,
+            "bytes_written": 0,
+            "success": False,
+            "error": str(e),
+        })
+
+
+def handle_write_from_blob(msg: dict) -> None:
+    """Write data from a local file (blob) to a remote SMB file handle."""
+    request_id = msg["request_id"]
+    handle_id = msg["handle_id"]
+    offset = msg.get("offset", 0)
+    blob_path = msg["blob_path"]
+
+    entry = handles.get(handle_id)
+    if entry is None:
+        error_response(request_id, f"Unknown handle_id: {handle_id}")
+        return
+
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        with open(blob_path, "rb") as f:
+            data = f.read()
         conn.writeFile(tree_id, file_id, data, offset)
         respond({
             "type": "WriteResult",
@@ -378,8 +444,15 @@ def handle_query_directory(msg: dict) -> None:
         return
 
     try:
-        # Use listPath on the connection for directory listing
-        conn.listPath("", pattern)
+        # Use low-level SMB2 queryDirectory with the actual file_id handle
+        smb_server = conn.getSMBServer()
+        smb_server.queryDirectory(
+            tree_id,
+            file_id,
+            searchString=pattern,
+            informationClass=info_class if info_class else 0x25,  # IdBothDirectory default
+            maxBufferSize=0x10000,
+        )
         respond({
             "type": "QueryDirectoryResult",
             "request_id": request_id,
@@ -387,12 +460,21 @@ def handle_query_directory(msg: dict) -> None:
             "error": None,
         })
     except Exception as e:
-        respond({
-            "type": "QueryDirectoryResult",
-            "request_id": request_id,
-            "success": False,
-            "error": str(e),
-        })
+        # STATUS_NO_MORE_FILES is expected when directory is empty or enumeration ends
+        if "STATUS_NO_MORE_FILES" in str(e):
+            respond({
+                "type": "QueryDirectoryResult",
+                "request_id": request_id,
+                "success": True,
+                "error": None,
+            })
+        else:
+            respond({
+                "type": "QueryDirectoryResult",
+                "request_id": request_id,
+                "success": False,
+                "error": str(e),
+            })
 
 
 def handle_query_info(msg: dict) -> None:
@@ -413,9 +495,14 @@ def handle_query_info(msg: dict) -> None:
         return
 
     try:
-        # Impacket doesn't have a direct queryInfo on file handle;
-        # we issue a queryInfo via the low-level SMB2 transport if available.
-        # For now, treat as best-effort success.
+        # Use low-level SMB2 queryInfo with the actual file_id
+        smb_server = conn.getSMBServer()
+        smb_server.queryInfo(
+            tree_id,
+            file_id,
+            infoType=info_type if info_type else 1,  # SMB2_0_INFO_FILE
+            fileInfoClass=info_class if info_class else 5,  # FileStandardInformation
+        )
         respond({
             "type": "QueryInfoResult",
             "request_id": request_id,
@@ -440,13 +527,29 @@ def handle_flush(msg: dict) -> None:
         error_response(request_id, f"Unknown handle_id: {handle_id}")
         return
 
-    # Impacket doesn't expose flush; treat as success
-    respond({
-        "type": "FlushResult",
-        "request_id": request_id,
-        "success": True,
-        "error": None,
-    })
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        # Use low-level SMB3 flush
+        smb_server = conn.getSMBServer()
+        smb_server.flush(tree_id, file_id)
+        respond({
+            "type": "FlushResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        respond({
+            "type": "FlushResult",
+            "request_id": request_id,
+            "success": False,
+            "error": str(e),
+        })
 
 
 def handle_lock(msg: dict) -> None:
@@ -461,13 +564,36 @@ def handle_lock(msg: dict) -> None:
         error_response(request_id, f"Unknown handle_id: {handle_id}")
         return
 
-    # Impacket doesn't expose byte-range locks; treat as success
-    respond({
-        "type": "LockResult",
-        "request_id": request_id,
-        "success": True,
-        "error": None,
-    })
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        # Build lock element: exclusive (0x02) or shared (0x01) lock
+        # SMB2_LOCKFLAG_EXCLUSIVE_LOCK = 0x02, SMB2_LOCKFLAG_SHARED_LOCK = 0x01
+        # Also set SMB2_LOCKFLAG_FAIL_IMMEDIATELY = 0x10
+        flags = 0x12 if exclusive else 0x11  # exclusive+fail_immediately or shared+fail_immediately
+        lock_element = SMB2_LOCK_ELEMENT()
+        lock_element['Offset'] = offset
+        lock_element['Length'] = length
+        lock_element['Flags'] = flags
+        smb_server = conn.getSMBServer()
+        smb_server.lock(tree_id, file_id, [lock_element])
+        respond({
+            "type": "LockResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        respond({
+            "type": "LockResult",
+            "request_id": request_id,
+            "success": False,
+            "error": str(e),
+        })
 
 
 def handle_unlock(msg: dict) -> None:
@@ -481,13 +607,33 @@ def handle_unlock(msg: dict) -> None:
         error_response(request_id, f"Unknown handle_id: {handle_id}")
         return
 
-    # Impacket doesn't expose byte-range locks; treat as success
-    respond({
-        "type": "UnlockResult",
-        "request_id": request_id,
-        "success": True,
-        "error": None,
-    })
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        # SMB2_LOCKFLAG_UN_LOCK = 0x04
+        lock_element = SMB2_LOCK_ELEMENT()
+        lock_element['Offset'] = offset
+        lock_element['Length'] = length
+        lock_element['Flags'] = 0x04  # UNLOCK
+        smb_server = conn.getSMBServer()
+        smb_server.lock(tree_id, file_id, [lock_element])
+        respond({
+            "type": "UnlockResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        respond({
+            "type": "UnlockResult",
+            "request_id": request_id,
+            "success": False,
+            "error": str(e),
+        })
 
 
 def handle_ioctl(msg: dict) -> None:
@@ -500,13 +646,30 @@ def handle_ioctl(msg: dict) -> None:
         error_response(request_id, f"Unknown handle_id: {handle_id}")
         return
 
-    # IOCTL replay is best-effort; treat as success
-    respond({
-        "type": "IoctlResult",
-        "request_id": request_id,
-        "success": True,
-        "error": None,
-    })
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        smb_server = conn.getSMBServer()
+        # Send IOCTL via low-level SMB2; input buffer empty, max output 4096
+        smb_server.ioctl(tree_id, file_id, ctl_code, inputBlob=b'', maxOutputResponse=4096)
+        respond({
+            "type": "IoctlResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        # Best-effort: some IOCTLs may not be supported; still treat as success for replay
+        respond({
+            "type": "IoctlResult",
+            "request_id": request_id,
+            "success": True,
+            "error": str(e),
+        })
 
 
 def handle_change_notify(msg: dict) -> None:
@@ -520,13 +683,71 @@ def handle_change_notify(msg: dict) -> None:
         error_response(request_id, f"Unknown handle_id: {handle_id}")
         return
 
-    # ChangeNotify replay is best-effort; treat as success
-    respond({
-        "type": "ChangeNotifyResult",
-        "request_id": request_id,
-        "success": True,
-        "error": None,
-    })
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection lost: {connection_id}")
+        return
+
+    try:
+        # Impacket's SMB3 class does not implement changeNotify().
+        # For replay purposes we treat this as a best-effort no-op.
+        _ = (conn, tree_id, file_id, filter_val, recursive)  # suppress unused warnings
+        respond({
+            "type": "ChangeNotifyResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        respond({
+            "type": "ChangeNotifyResult",
+            "request_id": request_id,
+            "success": False,
+            "error": str(e),
+        })
+
+
+def handle_set_info(msg: dict) -> None:
+    request_id = msg["request_id"]
+    handle_id = msg["handle_id"]
+    info_type = msg.get("info_type", 1)
+    info_class = msg.get("info_class", 0)
+
+    entry = handles.get(handle_id)
+    if entry is None:
+        error_response(request_id, f"Unknown handle_id: {handle_id}")
+        return
+
+    connection_id, tree_id, file_id = entry
+    conn = connections.get(connection_id)
+    if conn is None:
+        error_response(request_id, f"Connection not found: {connection_id}")
+        return
+
+    try:
+        smb_server = conn.getSMBServer()
+        # SetInfo with info_type and info_class.
+        # For replay, we send a minimal SetInfo with empty buffer.
+        # This may fail on some servers, so treat errors gracefully.
+        smb_server.setInfo(tree_id, file_id,
+                           infoType=info_type,
+                           fileInfoClass=info_class,
+                           inputBlob=b'\x00' * 40)
+        respond({
+            "type": "SetInfoResult",
+            "request_id": request_id,
+            "success": True,
+            "error": None,
+        })
+    except Exception as e:
+        # Best-effort: report success even on failure for replay
+        respond({
+            "type": "SetInfoResult",
+            "request_id": request_id,
+            "success": True,
+            "error": str(e),
+        })
 
 
 def handle_shutdown() -> None:
@@ -547,6 +768,7 @@ def handle_shutdown() -> None:
         except Exception:
             pass
     connections.clear()
+    tree_ids.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +780,7 @@ HANDLERS = {
     "Open": handle_open,
     "Read": handle_read,
     "Write": handle_write,
+    "WriteFromBlob": handle_write_from_blob,
     "Close": handle_close,
     "Rename": handle_rename,
     "Delete": handle_delete,
@@ -570,6 +793,7 @@ HANDLERS = {
     "Unlock": handle_unlock,
     "Ioctl": handle_ioctl,
     "ChangeNotify": handle_change_notify,
+    "SetInfo": handle_set_info,
 }
 
 

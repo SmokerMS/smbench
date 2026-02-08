@@ -18,6 +18,16 @@ pub enum WorkerRequest {
         connection_id: String,
         path: String,
         mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        desired_access: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        create_disposition: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        create_options: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        share_access: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_attributes: Option<u32>,
     },
     Write {
         request_id: String,
@@ -101,6 +111,12 @@ pub enum WorkerRequest {
         handle_id: String,
         filter: u32,
         recursive: bool,
+    },
+    SetInfo {
+        request_id: String,
+        handle_id: String,
+        info_type: u8,
+        info_class: u8,
     },
     Shutdown,
 }
@@ -188,6 +204,11 @@ pub enum WorkerResponse {
         error: Option<String>,
     },
     ChangeNotifyResult {
+        request_id: String,
+        success: bool,
+        error: Option<String>,
+    },
+    SetInfoResult {
         request_id: String,
         success: bool,
         error: Option<String>,

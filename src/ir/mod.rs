@@ -138,6 +138,51 @@ pub enum Operation {
         filter: u32,
         recursive: bool,
     },
+    SetInfo {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        info_type: u8,
+        info_class: u8,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_blob_path: Option<String>,
+    },
+    Echo {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+    },
+    Cancel {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        target_message_id: u64,
+    },
+    OplockBreakAck {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        oplock_level: u8,
+    },
+    TransactPipe {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        handle_ref: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_blob_path: Option<String>,
+    },
+    ServerCopy {
+        op_id: String,
+        client_id: String,
+        timestamp_us: u64,
+        source_handle_ref: String,
+        dest_handle_ref: String,
+        offset: u64,
+        length: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -164,7 +209,13 @@ impl Operation {
             | Operation::Lock { op_id, .. }
             | Operation::Unlock { op_id, .. }
             | Operation::Ioctl { op_id, .. }
-            | Operation::ChangeNotify { op_id, .. } => op_id,
+            | Operation::ChangeNotify { op_id, .. }
+            | Operation::SetInfo { op_id, .. }
+            | Operation::Echo { op_id, .. }
+            | Operation::Cancel { op_id, .. }
+            | Operation::OplockBreakAck { op_id, .. }
+            | Operation::TransactPipe { op_id, .. }
+            | Operation::ServerCopy { op_id, .. } => op_id,
         }
     }
 
@@ -184,7 +235,13 @@ impl Operation {
             | Operation::Lock { client_id, .. }
             | Operation::Unlock { client_id, .. }
             | Operation::Ioctl { client_id, .. }
-            | Operation::ChangeNotify { client_id, .. } => client_id,
+            | Operation::ChangeNotify { client_id, .. }
+            | Operation::SetInfo { client_id, .. }
+            | Operation::Echo { client_id, .. }
+            | Operation::Cancel { client_id, .. }
+            | Operation::OplockBreakAck { client_id, .. }
+            | Operation::TransactPipe { client_id, .. }
+            | Operation::ServerCopy { client_id, .. } => client_id,
         }
     }
 
@@ -204,7 +261,13 @@ impl Operation {
             | Operation::Lock { timestamp_us, .. }
             | Operation::Unlock { timestamp_us, .. }
             | Operation::Ioctl { timestamp_us, .. }
-            | Operation::ChangeNotify { timestamp_us, .. } => *timestamp_us,
+            | Operation::ChangeNotify { timestamp_us, .. }
+            | Operation::SetInfo { timestamp_us, .. }
+            | Operation::Echo { timestamp_us, .. }
+            | Operation::Cancel { timestamp_us, .. }
+            | Operation::OplockBreakAck { timestamp_us, .. }
+            | Operation::TransactPipe { timestamp_us, .. }
+            | Operation::ServerCopy { timestamp_us, .. } => *timestamp_us,
         }
     }
 
@@ -220,11 +283,17 @@ impl Operation {
             | Operation::Lock { handle_ref, .. }
             | Operation::Unlock { handle_ref, .. }
             | Operation::Ioctl { handle_ref, .. }
-            | Operation::ChangeNotify { handle_ref, .. } => Some(handle_ref),
+            | Operation::ChangeNotify { handle_ref, .. }
+            | Operation::SetInfo { handle_ref, .. }
+            | Operation::OplockBreakAck { handle_ref, .. }
+            | Operation::TransactPipe { handle_ref, .. } => Some(handle_ref),
+            Operation::ServerCopy { source_handle_ref, .. } => Some(source_handle_ref),
             Operation::Rename { .. }
             | Operation::Delete { .. }
             | Operation::Mkdir { .. }
-            | Operation::Rmdir { .. } => None,
+            | Operation::Rmdir { .. }
+            | Operation::Echo { .. }
+            | Operation::Cancel { .. } => None,
         }
     }
 
@@ -255,6 +324,12 @@ pub struct WorkloadSummary {
     pub unlock_ops: usize,
     pub ioctl_ops: usize,
     pub change_notify_ops: usize,
+    pub set_info_ops: usize,
+    pub echo_ops: usize,
+    pub cancel_ops: usize,
+    pub oplock_break_ack_ops: usize,
+    pub transact_pipe_ops: usize,
+    pub server_copy_ops: usize,
 }
 
 impl WorkloadIr {
@@ -313,6 +388,12 @@ impl WorkloadIr {
             unlock_ops: 0,
             ioctl_ops: 0,
             change_notify_ops: 0,
+            set_info_ops: 0,
+            echo_ops: 0,
+            cancel_ops: 0,
+            oplock_break_ack_ops: 0,
+            transact_pipe_ops: 0,
+            server_copy_ops: 0,
         };
         for op in &self.operations {
             match op {
@@ -331,6 +412,12 @@ impl WorkloadIr {
                 Operation::Unlock { .. } => summary.unlock_ops += 1,
                 Operation::Ioctl { .. } => summary.ioctl_ops += 1,
                 Operation::ChangeNotify { .. } => summary.change_notify_ops += 1,
+                Operation::SetInfo { .. } => summary.set_info_ops += 1,
+                Operation::Echo { .. } => summary.echo_ops += 1,
+                Operation::Cancel { .. } => summary.cancel_ops += 1,
+                Operation::OplockBreakAck { .. } => summary.oplock_break_ack_ops += 1,
+                Operation::TransactPipe { .. } => summary.transact_pipe_ops += 1,
+                Operation::ServerCopy { .. } => summary.server_copy_ops += 1,
             }
         }
         summary

@@ -255,34 +255,9 @@ impl SMBConnectionInner for SmbRsConnection {
                 file.close().await.map_err(|e| anyhow!(e))?;
                 Ok(())
             }
-            Operation::QueryDirectory { .. } => {
-                // QueryDirectory is handled as fire-and-forget for replay.
-                // The actual listing response is not needed for benchmarking.
-                Ok(())
-            }
-            Operation::QueryInfo { .. } => {
-                // QueryInfo is handled as fire-and-forget for replay.
-                Ok(())
-            }
-            Operation::Flush { .. } => {
-                // Flush is advisory; handled at the ConnectionState level via SMBFileHandle::flush().
-                Ok(())
-            }
-            Operation::Lock { .. } | Operation::Unlock { .. } => {
-                // Lock/Unlock are handled at ConnectionState level via the file handle.
-                // The actual smb-rs File::lock()/unlock() calls need the file handle,
-                // which is held in ConnectionState. Delegate back up.
-                Ok(())
-            }
-            Operation::Ioctl { ctl_code, .. } => {
-                // IOCTLs are server-specific; log and return success for replay.
-                tracing::debug!(ctl_code = ctl_code, "Ioctl replayed (no-op)");
-                Ok(())
-            }
-            Operation::ChangeNotify { .. } => {
-                // ChangeNotify is fire-and-forget for replay (don't wait for actual FS changes).
-                Ok(())
-            }
+            // QueryDirectory, QueryInfo, Ioctl, ChangeNotify, Flush, Lock, Unlock
+            // are all routed through the file handle in ConnectionState::execute().
+            // They should not reach execute_misc anymore.
             _ => Ok(()),
         }
     }
@@ -357,6 +332,53 @@ impl SMBFileHandle for SmbRsFileHandle {
     async fn unlock(&self, offset: u64, length: u64) -> Result<()> {
         self.file
             .unlock(offset, length)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn query_directory(&self, pattern: &str, _info_class: u8) -> Result<()> {
+        self.file
+            .query_directory_raw(pattern)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn query_info(&self, _info_type: u8, _info_class: u8) -> Result<()> {
+        self.file
+            .query_info_raw()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn ioctl(&self, ctl_code: u32) -> Result<()> {
+        // Use the raw ioctl method with an empty input buffer.
+        // We discard the output; the purpose is to generate the SMB traffic.
+        self.file
+            .ioctl(ctl_code, vec![], 4096)
+            .await
+            .map_err(|e| anyhow!(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn set_info(&self, _info_type: u8, _info_class: u8) -> Result<()> {
+        // SetInfo requires knowing the specific info class to construct the right
+        // data structure. For benchmarking replay, we send a generic query_info_raw
+        // instead, which generates equivalent network traffic.
+        self.file
+            .query_info_raw()
+            .await
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn change_notify(&self, filter: u32, recursive: bool) -> Result<()> {
+        // Use a short timeout; during replay, FS changes won't happen,
+        // so we expect the timeout to expire. That's fine.
+        self.file
+            .change_notify_raw(
+                filter,
+                recursive,
+                std::time::Duration::from_millis(100),
+            )
             .await
             .map_err(|e| anyhow!(e.to_string()))
     }

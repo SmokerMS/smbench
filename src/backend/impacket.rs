@@ -208,6 +208,11 @@ impl SMBConnectionInner for ImpacketConnection {
                 OpenMode::Write => "Write".to_string(),
                 OpenMode::ReadWrite => "ReadWrite".to_string(),
             },
+            desired_access: None,
+            create_disposition: None,
+            create_options: None,
+            share_access: None,
+            file_attributes: None,
         };
         let resp = w.request_response(&req).await?;
         match resp {
@@ -236,10 +241,52 @@ impl SMBConnectionInner for ImpacketConnection {
     async fn open_extended(
         &self,
         path: &str,
-        _extensions: &serde_json::Value,
+        extensions: &serde_json::Value,
     ) -> Result<Box<dyn SMBFileHandle>> {
-        // Impacket doesn't support the full extension set; fall back to simple open
-        self.open_simple(path, OpenMode::ReadWrite).await
+        let mut w = self.worker.lock().await;
+        let conn_id = w
+            .connection_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let desired_access = extensions.get("desired_access").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let create_disposition = extensions.get("create_disposition").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let create_options = extensions.get("create_options").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let share_access = extensions.get("share_access").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let file_attributes = extensions.get("file_attributes").and_then(|v| v.as_u64()).map(|v| v as u32);
+
+        let req = WorkerRequest::Open {
+            request_id: next_request_id(),
+            connection_id: conn_id,
+            path: path.to_string(),
+            mode: "ReadWrite".to_string(),
+            desired_access,
+            create_disposition,
+            create_options,
+            share_access,
+            file_attributes,
+        };
+        let resp = w.request_response(&req).await?;
+        match resp {
+            WorkerResponse::Opened {
+                handle_id,
+                success,
+                error,
+                ..
+            } => {
+                if !success {
+                    return Err(anyhow!(
+                        "Open failed: {}",
+                        error.unwrap_or_else(|| "unknown".to_string())
+                    ));
+                }
+                Ok(Box::new(ImpacketFileHandle {
+                    handle_id,
+                    worker: self.worker.clone(),
+                }))
+            }
+            WorkerResponse::Error { error, .. } => Err(anyhow!("Open error: {}", error)),
+            _ => Err(anyhow!("Unexpected response to Open")),
+        }
     }
 
     async fn execute_misc(&self, op: &Operation) -> Result<()> {
@@ -290,45 +337,8 @@ impl SMBConnectionInner for ImpacketConnection {
                 let resp = w.request_response(&req).await?;
                 check_success_response(&resp, "Rmdir")
             }
-            Operation::QueryDirectory { handle_ref, pattern, info_class, .. } => {
-                let req = WorkerRequest::QueryDirectory {
-                    request_id: next_request_id(),
-                    handle_id: handle_ref.clone(),
-                    pattern: pattern.clone(),
-                    info_class: *info_class,
-                };
-                let resp = w.request_response(&req).await?;
-                check_success_response(&resp, "QueryDirectory")
-            }
-            Operation::QueryInfo { handle_ref, info_type, info_class, .. } => {
-                let req = WorkerRequest::QueryInfo {
-                    request_id: next_request_id(),
-                    handle_id: handle_ref.clone(),
-                    info_type: *info_type,
-                    info_class: *info_class,
-                };
-                let resp = w.request_response(&req).await?;
-                check_success_response(&resp, "QueryInfo")
-            }
-            Operation::Ioctl { handle_ref, ctl_code, .. } => {
-                let req = WorkerRequest::Ioctl {
-                    request_id: next_request_id(),
-                    handle_id: handle_ref.clone(),
-                    ctl_code: *ctl_code,
-                };
-                let resp = w.request_response(&req).await?;
-                check_success_response(&resp, "Ioctl")
-            }
-            Operation::ChangeNotify { handle_ref, filter, recursive, .. } => {
-                let req = WorkerRequest::ChangeNotify {
-                    request_id: next_request_id(),
-                    handle_id: handle_ref.clone(),
-                    filter: *filter,
-                    recursive: *recursive,
-                };
-                let resp = w.request_response(&req).await?;
-                check_success_response(&resp, "ChangeNotify")
-            }
+            // QueryDirectory, QueryInfo, Ioctl, ChangeNotify are now routed
+            // through the file handle in ConnectionState::execute().
             _ => Ok(()),
         }
     }
@@ -449,6 +459,65 @@ impl SMBFileHandle for ImpacketFileHandle {
         let resp = w.request_response(&req).await?;
         check_success_response(&resp, "Unlock")
     }
+
+    async fn query_directory(&self, pattern: &str, info_class: u8) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::QueryDirectory {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            pattern: pattern.to_string(),
+            info_class,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "QueryDirectory")
+    }
+
+    async fn query_info(&self, info_type: u8, info_class: u8) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::QueryInfo {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            info_type,
+            info_class,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "QueryInfo")
+    }
+
+    async fn ioctl(&self, ctl_code: u32) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::Ioctl {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            ctl_code,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "Ioctl")
+    }
+
+    async fn set_info(&self, info_type: u8, info_class: u8) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::SetInfo {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            info_type,
+            info_class,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "SetInfo")
+    }
+
+    async fn change_notify(&self, filter: u32, recursive: bool) -> Result<()> {
+        let mut w = self.worker.lock().await;
+        let req = WorkerRequest::ChangeNotify {
+            request_id: next_request_id(),
+            handle_id: self.handle_id.clone(),
+            filter,
+            recursive,
+        };
+        let resp = w.request_response(&req).await?;
+        check_success_response(&resp, "ChangeNotify")
+    }
 }
 
 fn check_success_response(resp: &WorkerResponse, operation: &str) -> Result<()> {
@@ -464,7 +533,8 @@ fn check_success_response(resp: &WorkerResponse, operation: &str) -> Result<()> 
         | WorkerResponse::LockResult { success, error, .. }
         | WorkerResponse::UnlockResult { success, error, .. }
         | WorkerResponse::IoctlResult { success, error, .. }
-        | WorkerResponse::ChangeNotifyResult { success, error, .. } => {
+        | WorkerResponse::ChangeNotifyResult { success, error, .. }
+        | WorkerResponse::SetInfoResult { success, error, .. } => {
             if !*success {
                 return Err(anyhow!(
                     "{} failed: {}",

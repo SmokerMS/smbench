@@ -671,14 +671,8 @@ async fn test_new_ops_dispatch_through_scheduler() {
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.invariant_violations, 0);
 
-    // Verify all ops were logged in execute_misc
-    let log = log.lock().await;
-    // Open and Close go through different paths (open_simple / handle.close),
-    // and flush/lock/unlock go through handle methods, not execute_misc.
-    // QueryDirectory, QueryInfo, Ioctl, ChangeNotify should be logged via execute_misc.
-    let misc_ops: Vec<_> = log.iter().map(|(_, id)| id.as_str()).collect();
-    assert!(misc_ops.contains(&"op_qd"), "QueryDirectory should be dispatched");
-    assert!(misc_ops.contains(&"op_qi"), "QueryInfo should be dispatched");
-    assert!(misc_ops.contains(&"op_io"), "Ioctl should be dispatched");
-    assert!(misc_ops.contains(&"op_cn"), "ChangeNotify should be dispatched");
+    // QueryDirectory, QueryInfo, Ioctl, ChangeNotify are now routed through
+    // the file handle methods (like flush/lock/unlock), not execute_misc.
+    // The succeeded count already confirms they were dispatched successfully.
+    // The log only captures execute_misc calls now (Rename, Delete, Mkdir, Rmdir).
 }

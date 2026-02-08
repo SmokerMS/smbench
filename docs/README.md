@@ -26,6 +26,7 @@ This directory contains the complete architecture and design documentation for S
 | **[github-technology-survey.md](./github-technology-survey.md)** | Available libraries (Context7 research) | 📚 Reference |
 | **[adjacent-domains-analysis.md](./adjacent-domains-analysis.md)** | Learnings from similar systems | 📚 Reference |
 | **[technology-options-matrix.md](./technology-options-matrix.md)** | All technology alternatives | 📚 Reference |
+| **[smb-spec-inventory.md](./smb-spec-inventory.md)** | Microsoft Open Specs inventory, implementation roadmap & audit | 📚 Reference |
 | **[architecture-review.md](./architecture-review.md)** | Original review (historical) | 📝 Historical |
 | **[architecture.md](./architecture.md)** | v1.0 (superseded) | ❌ Outdated |
 | **[architecture-v1.1-revised.md](./architecture-v1.1-revised.md)** | v1.1 (superseded) | ❌ Outdated |
