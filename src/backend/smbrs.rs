@@ -12,12 +12,103 @@ use crate::backend::{
 };
 use crate::ir::{OpenMode, Operation};
 
+/// Authentication method for SMB connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// Automatically negotiate (NTLM or Kerberos depending on server/environment).
+    Auto,
+    /// Force NTLM authentication.
+    Ntlm,
+    /// Force Kerberos authentication.
+    Kerberos,
+}
+
+impl std::str::FromStr for AuthMethod {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "ntlm" => Ok(Self::Ntlm),
+            "kerberos" | "krb5" | "krb" => Ok(Self::Kerberos),
+            other => Err(anyhow!("unknown auth method: '{}' (expected: auto, ntlm, kerberos)", other)),
+        }
+    }
+}
+
+impl Default for AuthMethod {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl std::fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Ntlm => write!(f, "ntlm"),
+            Self::Kerberos => write!(f, "kerberos"),
+        }
+    }
+}
+
+/// Transport mode for SMB connections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Standard TCP transport (default).
+    Tcp,
+    /// RDMA transport (SMB Direct, [MS-SMBD]).
+    #[cfg(feature = "rdma")]
+    Rdma,
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+impl std::str::FromStr for TransportMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "tcp" => Ok(Self::Tcp),
+            #[cfg(feature = "rdma")]
+            "rdma" => Ok(Self::Rdma),
+            #[cfg(not(feature = "rdma"))]
+            "rdma" => Err(anyhow!("RDMA transport requires the 'rdma' feature flag")),
+            other => Err(anyhow!("unknown transport: '{}' (expected: tcp, rdma)", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for TransportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            #[cfg(feature = "rdma")]
+            Self::Rdma => write!(f, "rdma"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SmbRsConfig {
     pub server: String,
     pub share: String,
     pub user: String,
     pub pass: String,
+    /// Domain for authentication (e.g., "CONTOSO").
+    pub domain: Option<String>,
+    /// Authentication method to use.
+    pub auth_method: AuthMethod,
+    /// Path to Kerberos keytab file (for Kerberos auth).
+    pub kerberos_keytab: Option<std::path::PathBuf>,
+    /// Kerberos principal (e.g., "user@DOMAIN.COM").
+    pub kerberos_principal: Option<String>,
+    /// Kerberos KDC hostname/IP.
+    pub kerberos_kdc: Option<String>,
+    /// Transport mode (TCP or RDMA).
+    pub transport: TransportMode,
 }
 
 impl SmbRsConfig {
@@ -30,11 +121,31 @@ impl SmbRsConfig {
             .map_err(|_| anyhow!("SMBENCH_SMB_USER not set"))?;
         let pass = std::env::var("SMBENCH_SMB_PASS")
             .map_err(|_| anyhow!("SMBENCH_SMB_PASS not set"))?;
+
+        let domain = std::env::var("SMBENCH_SMB_DOMAIN").ok();
+        let auth_method = std::env::var("SMBENCH_AUTH_METHOD")
+            .map(|v| v.parse::<AuthMethod>().unwrap_or_default())
+            .unwrap_or_default();
+        let kerberos_keytab = std::env::var("SMBENCH_KERBEROS_KEYTAB")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let kerberos_principal = std::env::var("SMBENCH_KERBEROS_PRINCIPAL").ok();
+        let kerberos_kdc = std::env::var("SMBENCH_KERBEROS_KDC").ok();
+        let transport = std::env::var("SMBENCH_TRANSPORT")
+            .map(|v| v.parse::<TransportMode>().unwrap_or_default())
+            .unwrap_or_default();
+
         Ok(Self {
             server,
             share,
             user,
             pass,
+            domain,
+            auth_method,
+            kerberos_keytab,
+            kerberos_principal,
+            kerberos_kdc,
+            transport,
         })
     }
 }
@@ -1169,5 +1280,89 @@ mod tests {
         assert_eq!(absolute.server(), "server");
         assert_eq!(absolute.share(), Some("share"));
         assert_eq!(absolute.path(), Some("dir\\file.txt"));
+    }
+
+    // ── Phase B4: AuthMethod tests ───────────────────────────────────
+
+    #[test]
+    fn test_auth_method_parse_auto() {
+        assert_eq!("auto".parse::<AuthMethod>().unwrap(), AuthMethod::Auto);
+        assert_eq!("AUTO".parse::<AuthMethod>().unwrap(), AuthMethod::Auto);
+        assert_eq!("Auto".parse::<AuthMethod>().unwrap(), AuthMethod::Auto);
+    }
+
+    #[test]
+    fn test_auth_method_parse_ntlm() {
+        assert_eq!("ntlm".parse::<AuthMethod>().unwrap(), AuthMethod::Ntlm);
+        assert_eq!("NTLM".parse::<AuthMethod>().unwrap(), AuthMethod::Ntlm);
+    }
+
+    #[test]
+    fn test_auth_method_parse_kerberos() {
+        assert_eq!("kerberos".parse::<AuthMethod>().unwrap(), AuthMethod::Kerberos);
+        assert_eq!("krb5".parse::<AuthMethod>().unwrap(), AuthMethod::Kerberos);
+        assert_eq!("krb".parse::<AuthMethod>().unwrap(), AuthMethod::Kerberos);
+    }
+
+    #[test]
+    fn test_auth_method_parse_invalid() {
+        assert!("invalid".parse::<AuthMethod>().is_err());
+        assert!("".parse::<AuthMethod>().is_err());
+    }
+
+    #[test]
+    fn test_auth_method_display() {
+        assert_eq!(AuthMethod::Auto.to_string(), "auto");
+        assert_eq!(AuthMethod::Ntlm.to_string(), "ntlm");
+        assert_eq!(AuthMethod::Kerberos.to_string(), "kerberos");
+    }
+
+    #[test]
+    fn test_auth_method_default() {
+        assert_eq!(AuthMethod::default(), AuthMethod::Auto);
+    }
+
+    #[test]
+    fn test_auth_method_roundtrip() {
+        for method in [AuthMethod::Auto, AuthMethod::Ntlm, AuthMethod::Kerberos] {
+            let s = method.to_string();
+            let parsed: AuthMethod = s.parse().unwrap();
+            assert_eq!(method, parsed);
+        }
+    }
+
+    // ── Phase D3: TransportMode tests ────────────────────────────────
+
+    #[test]
+    fn test_transport_mode_parse_tcp() {
+        assert_eq!("tcp".parse::<TransportMode>().unwrap(), TransportMode::Tcp);
+        assert_eq!("TCP".parse::<TransportMode>().unwrap(), TransportMode::Tcp);
+    }
+
+    #[test]
+    fn test_transport_mode_rdma_without_feature() {
+        // Without the "rdma" feature, parsing "rdma" should fail
+        #[cfg(not(feature = "rdma"))]
+        {
+            let result = "rdma".parse::<TransportMode>();
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("rdma"));
+        }
+    }
+
+    #[test]
+    fn test_transport_mode_parse_invalid() {
+        assert!("invalid".parse::<TransportMode>().is_err());
+        assert!("quic".parse::<TransportMode>().is_err());
+    }
+
+    #[test]
+    fn test_transport_mode_default() {
+        assert_eq!(TransportMode::default(), TransportMode::Tcp);
+    }
+
+    #[test]
+    fn test_transport_mode_display() {
+        assert_eq!(TransportMode::Tcp.to_string(), "tcp");
     }
 }

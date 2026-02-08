@@ -87,6 +87,9 @@ const SMB2_FLAGS_ASYNC_COMMAND: u32 = 0x0000_0002;
 /// The SMB2 header magic bytes: 0xFE 'S' 'M' 'B'.
 const SMB2_MAGIC: &[u8; 4] = b"\xfeSMB";
 
+/// The SMB1 header magic bytes: 0xFF 'S' 'M' 'B'.
+const SMB1_MAGIC: &[u8; 4] = b"\xffSMB";
+
 // ── parsed types ──
 
 /// A parsed SMB2 message (header + command payload).
@@ -116,10 +119,33 @@ pub struct SmbMessage {
     pub is_async: bool,
 }
 
+/// Parameters extracted from SMB2 NEGOTIATE request/response.
+#[derive(Debug, Clone)]
+pub struct NegotiateParams {
+    /// Dialect count (request only).
+    pub dialect_count: u16,
+    /// List of supported dialects (request only). Values like 0x0202, 0x0210, 0x0300, 0x0302, 0x0311.
+    pub dialects: Vec<u16>,
+    /// Selected dialect (response only).
+    pub dialect_revision: u16,
+    /// Security mode flags.
+    pub security_mode: u16,
+    /// Capabilities flags.
+    pub capabilities: u32,
+    /// Client or server GUID.
+    pub guid: [u8; 16],
+    /// Max transact size (response only).
+    pub max_transact_size: u32,
+    /// Max read size (response only).
+    pub max_read_size: u32,
+    /// Max write size (response only).
+    pub max_write_size: u32,
+}
+
 /// Parsed SMB2 command payloads.
 #[derive(Debug, Clone)]
 pub enum SmbCommand {
-    Negotiate,
+    Negotiate(NegotiateParams),
     SessionSetup {
         /// Session flags from response (IS_GUEST=0x01, IS_NULL=0x02, ENCRYPT_DATA=0x04).
         session_flags: Option<u16>,
@@ -198,6 +224,8 @@ pub enum SmbCommand {
     Cancel {
         cancelled_message_id: u64,
     },
+    /// An SMB1 message was detected (legacy protocol).
+    Smb1Detected,
     /// Commands we don't parse in detail.
     Other {
         code: u16,
@@ -239,6 +267,58 @@ pub struct SetInfoParams {
     pub file_info_class: u8,
     /// If this is a FileRenameInformation (class 10 / 0x0A), the new name.
     pub rename_target: Option<String>,
+    /// If FileDispositionInformation (class 13 / 0x0D), the delete flag.
+    pub delete_on_close: Option<bool>,
+    /// If FileEndOfFileInformation (class 20 / 0x14), the new end-of-file position.
+    pub end_of_file: Option<u64>,
+}
+
+/// Returns a human-readable name for common [MS-FSCC] file information classes.
+pub fn file_info_class_name(info_type: u8, info_class: u8) -> &'static str {
+    if info_type == 0x01 {
+        // SMB2_0_INFO_FILE
+        match info_class {
+            0x04 => "FileBasicInformation",
+            0x05 => "FileStandardInformation",
+            0x06 => "FileInternalInformation",
+            0x07 => "FileEaInformation",
+            0x08 => "FileAccessInformation",
+            0x09 => "FileNameInformation",
+            0x0A => "FileRenameInformation",
+            0x0D => "FileDispositionInformation",
+            0x0E => "FilePositionInformation",
+            0x0F => "FileFullEaInformation",
+            0x10 => "FileModeInformation",
+            0x11 => "FileAlignmentInformation",
+            0x12 => "FileAllInformation",
+            0x14 => "FileEndOfFileInformation",
+            0x16 => "FileStreamInformation",
+            0x1C => "FileCompressionInformation",
+            0x22 => "FileNetworkOpenInformation",
+            0x23 => "FileAttributeTagInformation",
+            0x3B => "FileIdBothDirectoryInformation",
+            0x3C => "FileIdFullDirectoryInformation",
+            0x40 => "FileNormalizedNameInformation",
+            _ => "Unknown",
+        }
+    } else if info_type == 0x02 {
+        // SMB2_0_INFO_FILESYSTEM
+        match info_class {
+            0x01 => "FileFsVolumeInformation",
+            0x03 => "FileFsSizeInformation",
+            0x04 => "FileFsDeviceInformation",
+            0x05 => "FileFsAttributeInformation",
+            0x06 => "FileFsControlInformation",
+            0x07 => "FileFsFullSizeInformation",
+            0x08 => "FileFsObjectIdInformation",
+            0x0B => "FileFsSectorSizeInformation",
+            _ => "Unknown",
+        }
+    } else if info_type == 0x03 {
+        "SecurityInformation"
+    } else {
+        "Unknown"
+    }
 }
 
 /// A single lock element from an SMB2 LOCK request [MS-SMB2 2.2.26.1].
@@ -253,14 +333,77 @@ pub struct LockElement {
 /// 16-byte SMB2 FileId [MS-SMB2 2.2.14.1].
 pub type FileId = [u8; 16];
 
+// ── FSCTL control codes [MS-FSCC / MS-SMB2] ────────────────────────
+pub const FSCTL_PIPE_TRANSACT: u32 = 0x0011_C017;
+pub const FSCTL_SRV_COPYCHUNK: u32 = 0x0014_40F2;
+pub const FSCTL_SRV_COPYCHUNK_WRITE: u32 = 0x0014_80F2;
+pub const FSCTL_SRV_REQUEST_RESUME_KEY: u32 = 0x0014_0078;
+pub const FSCTL_QUERY_NETWORK_INTERFACE_INFO: u32 = 0x0014_01FC;
+pub const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+pub const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+pub const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
+pub const FSCTL_SET_ZERO_DATA: u32 = 0x0009_80C8;
+pub const FSCTL_CREATE_OR_GET_OBJECT_ID: u32 = 0x0009_00C0;
+pub const FSCTL_DFS_GET_REFERRALS: u32 = 0x0006_0194;
+pub const FSCTL_VALIDATE_NEGOTIATE_INFO: u32 = 0x0014_0204;
+pub const FSCTL_PIPE_WAIT: u32 = 0x0011_0018;
+pub const FSCTL_PIPE_PEEK: u32 = 0x0011_C01C;
+pub const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+pub const FSCTL_FILE_LEVEL_TRIM: u32 = 0x0009_8208;
+pub const FSCTL_OFFLOAD_READ: u32 = 0x0009_43E4;
+pub const FSCTL_OFFLOAD_WRITE: u32 = 0x0009_87E8;
+pub const FSCTL_SRV_ENUMERATE_SNAPSHOTS: u32 = 0x0014_4064;
+pub const FSCTL_SRV_READ_HASH: u32 = 0x0014_41BB;
+
+/// Returns a human-readable name for a known FSCTL code, or `None` for unknown codes.
+pub fn fsctl_name(ctl_code: u32) -> Option<&'static str> {
+    match ctl_code {
+        FSCTL_PIPE_TRANSACT => Some("FSCTL_PIPE_TRANSACT"),
+        FSCTL_SRV_COPYCHUNK => Some("FSCTL_SRV_COPYCHUNK"),
+        FSCTL_SRV_COPYCHUNK_WRITE => Some("FSCTL_SRV_COPYCHUNK_WRITE"),
+        FSCTL_SRV_REQUEST_RESUME_KEY => Some("FSCTL_SRV_REQUEST_RESUME_KEY"),
+        FSCTL_QUERY_NETWORK_INTERFACE_INFO => Some("FSCTL_QUERY_NETWORK_INTERFACE_INFO"),
+        FSCTL_GET_REPARSE_POINT => Some("FSCTL_GET_REPARSE_POINT"),
+        FSCTL_SET_REPARSE_POINT => Some("FSCTL_SET_REPARSE_POINT"),
+        FSCTL_QUERY_ALLOCATED_RANGES => Some("FSCTL_QUERY_ALLOCATED_RANGES"),
+        FSCTL_SET_ZERO_DATA => Some("FSCTL_SET_ZERO_DATA"),
+        FSCTL_CREATE_OR_GET_OBJECT_ID => Some("FSCTL_CREATE_OR_GET_OBJECT_ID"),
+        FSCTL_DFS_GET_REFERRALS => Some("FSCTL_DFS_GET_REFERRALS"),
+        FSCTL_VALIDATE_NEGOTIATE_INFO => Some("FSCTL_VALIDATE_NEGOTIATE_INFO"),
+        FSCTL_PIPE_WAIT => Some("FSCTL_PIPE_WAIT"),
+        FSCTL_PIPE_PEEK => Some("FSCTL_PIPE_PEEK"),
+        FSCTL_SET_SPARSE => Some("FSCTL_SET_SPARSE"),
+        FSCTL_FILE_LEVEL_TRIM => Some("FSCTL_FILE_LEVEL_TRIM"),
+        FSCTL_OFFLOAD_READ => Some("FSCTL_OFFLOAD_READ"),
+        FSCTL_OFFLOAD_WRITE => Some("FSCTL_OFFLOAD_WRITE"),
+        FSCTL_SRV_ENUMERATE_SNAPSHOTS => Some("FSCTL_SRV_ENUMERATE_SNAPSHOTS"),
+        FSCTL_SRV_READ_HASH => Some("FSCTL_SRV_READ_HASH"),
+        _ => None,
+    }
+}
+
 // ── parser implementation ──
 
+/// Parser statistics for tracking skipped messages.
+#[derive(Debug, Clone, Default)]
+pub struct SmbParserStats {
+    /// Number of SMB1 messages that were detected and skipped.
+    pub smb1_messages_skipped: u64,
+    /// Number of SMB2 messages successfully parsed.
+    pub smb2_messages_parsed: u64,
+}
+
 /// SMB message parser.
-pub struct SmbParser;
+pub struct SmbParser {
+    /// Accumulated parser statistics.
+    pub stats: SmbParserStats,
+}
 
 impl SmbParser {
     pub fn new() -> Self {
-        Self
+        Self {
+            stats: SmbParserStats::default(),
+        }
     }
 
     /// Parse all SMB2 messages from a reassembled TCP stream.
@@ -300,7 +443,7 @@ impl SmbParser {
 
     /// Parse one or more (compound) SMB2 messages from a single NetBIOS PDU.
     fn parse_smb_pdu(
-        &self,
+        &mut self,
         data: &[u8],
         base_timestamp_us: u64,
         out: &mut Vec<SmbMessage>,
@@ -308,10 +451,22 @@ impl SmbParser {
         let mut cursor = data;
         let mut compound_idx: u16 = 0;
         loop {
+            if cursor.len() < 4 {
+                break;
+            }
+
+            // Check for SMB1 magic — skip with a warning
+            if cursor.len() >= 4 && &cursor[0..4] == SMB1_MAGIC {
+                tracing::warn!("SMB1 message detected and skipped (legacy protocol)");
+                self.stats.smb1_messages_skipped += 1;
+                // SMB1 header is 32 bytes; we can't reliably parse it so skip the entire PDU
+                break;
+            }
+
             if cursor.len() < 64 {
                 break;
             }
-            // Validate magic
+            // Validate SMB2 magic
             if &cursor[0..4] != SMB2_MAGIC {
                 break;
             }
@@ -319,6 +474,7 @@ impl SmbParser {
             match self.parse_header_and_command(cursor, base_timestamp_us) {
                 Ok((next_command_offset, mut msg)) => {
                     msg.compound_index = compound_idx;
+                    self.stats.smb2_messages_parsed += 1;
                     out.push(msg);
                     compound_idx += 1;
                     if next_command_offset == 0 {
@@ -396,7 +552,13 @@ impl SmbParser {
         is_response: bool,
     ) -> Result<SmbCommand> {
         match code {
-            SmbCommandCode::Negotiate => Ok(SmbCommand::Negotiate),
+            SmbCommandCode::Negotiate => {
+                if is_response {
+                    parse_negotiate_response(payload)
+                } else {
+                    parse_negotiate_request(payload)
+                }
+            }
             SmbCommandCode::SessionSetup => {
                 if is_response && payload.len() >= 4 {
                     let session_flags = u16::from_le_bytes([payload[2], payload[3]]);
@@ -511,6 +673,8 @@ impl SmbParser {
                         info_type: 0,
                         file_info_class: 0,
                         rename_target: None,
+                        delete_on_close: None,
+                        end_of_file: None,
                     }))
                 }
             }
@@ -634,6 +798,13 @@ impl Default for SmbParser {
     }
 }
 
+impl SmbParserStats {
+    /// Returns the total number of messages encountered.
+    pub fn total_messages(&self) -> u64 {
+        self.smb2_messages_parsed + self.smb1_messages_skipped
+    }
+}
+
 // ── nom sub-parsers ──
 
 struct RawHeader {
@@ -680,6 +851,68 @@ fn parse_file_id_at(data: &[u8], offset: usize) -> Result<FileId> {
     let mut fid = [0u8; 16];
     fid.copy_from_slice(&data[offset..offset + 16]);
     Ok(fid)
+}
+
+/// [MS-SMB2 2.2.3] NEGOTIATE Request
+fn parse_negotiate_request(payload: &[u8]) -> Result<SmbCommand> {
+    // StructureSize(2) + DialectCount(2) + SecurityMode(2) + Reserved(2)
+    // + Capabilities(4) + ClientGuid(16) + NegotiateContextOffset/Count/Reserved2(8)
+    // = 36 bytes fixed, followed by Dialects (each 2 bytes)
+    if payload.len() < 36 {
+        return Ok(SmbCommand::Negotiate(NegotiateParams {
+            dialect_count: 0, dialects: Vec::new(), dialect_revision: 0,
+            security_mode: 0, capabilities: 0, guid: [0; 16],
+            max_transact_size: 0, max_read_size: 0, max_write_size: 0,
+        }));
+    }
+    let dialect_count = u16::from_le_bytes([payload[2], payload[3]]);
+    let security_mode = u16::from_le_bytes([payload[4], payload[5]]);
+    let capabilities = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&payload[12..28]);
+
+    let mut dialects = Vec::with_capacity(dialect_count as usize);
+    let dialects_start = 36;
+    for i in 0..dialect_count as usize {
+        let off = dialects_start + i * 2;
+        if off + 2 > payload.len() { break; }
+        dialects.push(u16::from_le_bytes([payload[off], payload[off + 1]]));
+    }
+
+    Ok(SmbCommand::Negotiate(NegotiateParams {
+        dialect_count, dialects, dialect_revision: 0,
+        security_mode, capabilities, guid,
+        max_transact_size: 0, max_read_size: 0, max_write_size: 0,
+    }))
+}
+
+/// [MS-SMB2 2.2.4] NEGOTIATE Response
+fn parse_negotiate_response(payload: &[u8]) -> Result<SmbCommand> {
+    // StructureSize(2) + SecurityMode(2) + DialectRevision(2) + NegotiateContextCount/Reserved(2)
+    // + ServerGuid(16) + Capabilities(4) + MaxTransactSize(4) + MaxReadSize(4) + MaxWriteSize(4)
+    // + SystemTime(8) + ServerStartTime(8) + SecurityBufferOffset(2) + SecurityBufferLength(2) + ...
+    // = 64 bytes minimum fixed
+    if payload.len() < 64 {
+        return Ok(SmbCommand::Negotiate(NegotiateParams {
+            dialect_count: 0, dialects: Vec::new(), dialect_revision: 0,
+            security_mode: 0, capabilities: 0, guid: [0; 16],
+            max_transact_size: 0, max_read_size: 0, max_write_size: 0,
+        }));
+    }
+    let security_mode = u16::from_le_bytes([payload[2], payload[3]]);
+    let dialect_revision = u16::from_le_bytes([payload[4], payload[5]]);
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&payload[8..24]);
+    let capabilities = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+    let max_transact_size = u32::from_le_bytes([payload[28], payload[29], payload[30], payload[31]]);
+    let max_read_size = u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]]);
+    let max_write_size = u32::from_le_bytes([payload[36], payload[37], payload[38], payload[39]]);
+
+    Ok(SmbCommand::Negotiate(NegotiateParams {
+        dialect_count: 0, dialects: Vec::new(), dialect_revision,
+        security_mode, capabilities, guid,
+        max_transact_size, max_read_size, max_write_size,
+    }))
 }
 
 /// [MS-SMB2 2.2.9] TREE_CONNECT Request
@@ -911,20 +1144,45 @@ fn parse_set_info_request(payload: &[u8]) -> Result<SmbCommand> {
     let file_id = parse_file_id_at(payload, 16)?;
 
     let mut rename_target = None;
+    let mut delete_on_close = None;
+    let mut end_of_file = None;
 
-    // FileRenameInformation = class 10 (0x0A), InfoType = FILE (0x01)
-    if info_type == 0x01 && file_info_class == 0x0A {
-        let adj = buffer_offset.saturating_sub(64);
-        if adj + buffer_length <= payload.len() && buffer_length >= 24 {
-            let rename_buf = &payload[adj..adj + buffer_length];
-            // FileRenameInformation2 [MS-FSCC 2.4.34.2]:
-            //  ReplaceIfExists (1) + Reserved (7) + RootDirectory (8) + FileNameLength (4) + FileName
-            let name_len = u32::from_le_bytes([
-                rename_buf[16], rename_buf[17], rename_buf[18], rename_buf[19],
-            ]) as usize;
-            if 20 + name_len <= rename_buf.len() {
-                rename_target = decode_utf16le(&rename_buf[20..20 + name_len]);
+    let adj = buffer_offset.saturating_sub(64);
+
+    if info_type == 0x01 {
+        match file_info_class {
+            // FileRenameInformation = class 10 (0x0A)
+            0x0A => {
+                if adj + buffer_length <= payload.len() && buffer_length >= 24 {
+                    let rename_buf = &payload[adj..adj + buffer_length];
+                    // FileRenameInformation2 [MS-FSCC 2.4.34.2]:
+                    //  ReplaceIfExists (1) + Reserved (7) + RootDirectory (8) + FileNameLength (4) + FileName
+                    let name_len = u32::from_le_bytes([
+                        rename_buf[16], rename_buf[17], rename_buf[18], rename_buf[19],
+                    ]) as usize;
+                    if 20 + name_len <= rename_buf.len() {
+                        rename_target = decode_utf16le(&rename_buf[20..20 + name_len]);
+                    }
+                }
             }
+            // FileDispositionInformation = class 13 (0x0D)
+            0x0D => {
+                if adj + buffer_length <= payload.len() && buffer_length >= 1 {
+                    let buf = &payload[adj..adj + buffer_length];
+                    delete_on_close = Some(buf[0] != 0);
+                }
+            }
+            // FileEndOfFileInformation = class 20 (0x14)
+            0x14 => {
+                if adj + buffer_length <= payload.len() && buffer_length >= 8 {
+                    let buf = &payload[adj..adj + buffer_length];
+                    end_of_file = Some(u64::from_le_bytes([
+                        buf[0], buf[1], buf[2], buf[3],
+                        buf[4], buf[5], buf[6], buf[7],
+                    ]));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -933,6 +1191,8 @@ fn parse_set_info_request(payload: &[u8]) -> Result<SmbCommand> {
         info_type,
         file_info_class,
         rename_target,
+        delete_on_close,
+        end_of_file,
     }))
 }
 
@@ -1051,7 +1311,7 @@ mod tests {
     #[test]
     fn test_parse_negotiate() {
         let msg = parse_one(&build_smb2_message(0x0000, 0, 0, 0, 0, 0, &[]));
-        assert!(matches!(msg.command, SmbCommand::Negotiate));
+        assert!(matches!(msg.command, SmbCommand::Negotiate(_)));
         assert_eq!(msg.message_id, 0);
         assert!(!msg.is_response);
     }
@@ -1172,7 +1432,7 @@ mod tests {
         assert!(!msgs[0].compound_last, "first in compound should not be last");
         assert_eq!(msgs[1].compound_index, 1);
         assert!(msgs[1].compound_last, "second (final) in compound should be last");
-        assert!(matches!(msgs[0].command, SmbCommand::Negotiate));
+        assert!(matches!(msgs[0].command, SmbCommand::Negotiate(_)));
         assert!(matches!(msgs[1].command, SmbCommand::Echo));
     }
 
@@ -1843,5 +2103,251 @@ mod tests {
     fn test_parse_create_context_tags_empty_buffer() {
         let tags = parse_create_context_tags(&[]);
         assert!(tags.is_empty());
+    }
+
+    // ── Phase A: NEGOTIATE parsing tests ─────────────────────────────
+
+    #[test]
+    fn test_parse_negotiate_request_with_dialects() {
+        // [MS-SMB2 2.2.3] NEGOTIATE Request: 36 bytes fixed + dialects
+        let mut payload = vec![0u8; 36 + 6]; // 3 dialects
+        payload[0..2].copy_from_slice(&36u16.to_le_bytes()); // StructureSize
+        payload[2..4].copy_from_slice(&3u16.to_le_bytes()); // DialectCount
+        payload[4..6].copy_from_slice(&0x0001u16.to_le_bytes()); // SecurityMode
+        payload[8..12].copy_from_slice(&0x0000_007Fu32.to_le_bytes()); // Capabilities
+        payload[12..28].copy_from_slice(&[0xAA; 16]); // ClientGuid
+        // Dialects: SMB 2.0.2, SMB 2.1, SMB 3.0
+        payload[36..38].copy_from_slice(&0x0202u16.to_le_bytes());
+        payload[38..40].copy_from_slice(&0x0210u16.to_le_bytes());
+        payload[40..42].copy_from_slice(&0x0300u16.to_le_bytes());
+
+        let msg = parse_one(&build_smb2_message(0x0000, 0, 0, 0, 0, 0, &payload));
+        match &msg.command {
+            SmbCommand::Negotiate(params) => {
+                assert_eq!(params.dialect_count, 3);
+                assert_eq!(params.dialects, vec![0x0202, 0x0210, 0x0300]);
+                assert_eq!(params.security_mode, 0x0001);
+                assert_eq!(params.capabilities, 0x0000_007F);
+                assert_eq!(params.guid, [0xAA; 16]);
+                assert_eq!(params.dialect_revision, 0); // not set for requests
+            }
+            other => panic!("expected Negotiate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_negotiate_response_with_dialect() {
+        // [MS-SMB2 2.2.4] NEGOTIATE Response: 64 bytes fixed
+        let mut payload = vec![0u8; 64];
+        payload[0..2].copy_from_slice(&65u16.to_le_bytes()); // StructureSize
+        payload[2..4].copy_from_slice(&0x0003u16.to_le_bytes()); // SecurityMode
+        payload[4..6].copy_from_slice(&0x0311u16.to_le_bytes()); // DialectRevision = SMB 3.1.1
+        payload[8..24].copy_from_slice(&[0xBB; 16]); // ServerGuid
+        payload[24..28].copy_from_slice(&0x0000_003Fu32.to_le_bytes()); // Capabilities
+        payload[28..32].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // MaxTransactSize
+        payload[32..36].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // MaxReadSize
+        payload[36..40].copy_from_slice(&0x0010_0000u32.to_le_bytes()); // MaxWriteSize
+
+        let smb = build_smb2_message(0x0000, SMB2_FLAGS_SERVER_TO_REDIR, 0, 0, 0, 0, &payload);
+        let msg = parse_one(&smb);
+        match &msg.command {
+            SmbCommand::Negotiate(params) => {
+                assert_eq!(params.dialect_revision, 0x0311);
+                assert_eq!(params.security_mode, 0x0003);
+                assert_eq!(params.capabilities, 0x0000_003F);
+                assert_eq!(params.guid, [0xBB; 16]);
+                assert_eq!(params.max_transact_size, 0x0010_0000);
+                assert_eq!(params.max_read_size, 0x0010_0000);
+                assert_eq!(params.max_write_size, 0x0010_0000);
+            }
+            other => panic!("expected Negotiate, got {:?}", other),
+        }
+    }
+
+    // ── Phase A: FSCC info class tests ───────────────────────────────
+
+    #[test]
+    fn test_parse_set_info_disposition() {
+        // SET_INFO with FileDispositionInformation (InfoType=0x01, Class=0x0D)
+        let delete_buf = [1u8]; // DeleteFile = TRUE
+        let buffer_offset = (64 + 32) as u16;
+        let buffer_length = delete_buf.len() as u32;
+
+        let mut payload = vec![0u8; 32];
+        payload[0..2].copy_from_slice(&33u16.to_le_bytes());
+        payload[2] = 0x01; // InfoType = FILE
+        payload[3] = 0x0D; // FileInfoClass = FileDispositionInformation
+        payload[4..8].copy_from_slice(&buffer_length.to_le_bytes());
+        payload[8..10].copy_from_slice(&buffer_offset.to_le_bytes());
+        payload[16..32].copy_from_slice(&[0xAA; 16]);
+        payload.extend_from_slice(&delete_buf);
+
+        let msg = parse_one(&build_smb2_message(0x0011, 0, 20, 100, 200, 0, &payload));
+        match &msg.command {
+            SmbCommand::SetInfo(params) => {
+                assert_eq!(params.file_info_class, 0x0D);
+                assert_eq!(params.delete_on_close, Some(true));
+                assert!(params.rename_target.is_none());
+                assert!(params.end_of_file.is_none());
+            }
+            other => panic!("expected SetInfo, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_info_end_of_file() {
+        // SET_INFO with FileEndOfFileInformation (InfoType=0x01, Class=0x14)
+        let eof_buf = 65536u64.to_le_bytes();
+        let buffer_offset = (64 + 32) as u16;
+        let buffer_length = eof_buf.len() as u32;
+
+        let mut payload = vec![0u8; 32];
+        payload[0..2].copy_from_slice(&33u16.to_le_bytes());
+        payload[2] = 0x01; // InfoType = FILE
+        payload[3] = 0x14; // FileInfoClass = FileEndOfFileInformation
+        payload[4..8].copy_from_slice(&buffer_length.to_le_bytes());
+        payload[8..10].copy_from_slice(&buffer_offset.to_le_bytes());
+        payload[16..32].copy_from_slice(&[0xBB; 16]);
+        payload.extend_from_slice(&eof_buf);
+
+        let msg = parse_one(&build_smb2_message(0x0011, 0, 21, 100, 200, 0, &payload));
+        match &msg.command {
+            SmbCommand::SetInfo(params) => {
+                assert_eq!(params.file_info_class, 0x14);
+                assert_eq!(params.end_of_file, Some(65536));
+                assert!(params.delete_on_close.is_none());
+                assert!(params.rename_target.is_none());
+            }
+            other => panic!("expected SetInfo, got {:?}", other),
+        }
+    }
+
+    // ── Phase A: FSCTL name resolution tests ─────────────────────────
+
+    #[test]
+    fn test_fsctl_name_known_codes() {
+        assert_eq!(fsctl_name(0x0011_C017), Some("FSCTL_PIPE_TRANSACT"));
+        assert_eq!(fsctl_name(0x0014_40F2), Some("FSCTL_SRV_COPYCHUNK"));
+        assert_eq!(fsctl_name(0x0014_80F2), Some("FSCTL_SRV_COPYCHUNK_WRITE"));
+        assert_eq!(fsctl_name(0x0014_0078), Some("FSCTL_SRV_REQUEST_RESUME_KEY"));
+        assert_eq!(fsctl_name(0x0014_01FC), Some("FSCTL_QUERY_NETWORK_INTERFACE_INFO"));
+        assert_eq!(fsctl_name(0x0006_0194), Some("FSCTL_DFS_GET_REFERRALS"));
+        assert_eq!(fsctl_name(0x0014_0204), Some("FSCTL_VALIDATE_NEGOTIATE_INFO"));
+    }
+
+    #[test]
+    fn test_fsctl_name_unknown_code() {
+        assert_eq!(fsctl_name(0xDEAD_BEEF), None);
+        assert_eq!(fsctl_name(0), None);
+    }
+
+    // ── Phase A: file info class name tests ──────────────────────────
+
+    #[test]
+    fn test_file_info_class_name_file() {
+        assert_eq!(file_info_class_name(0x01, 0x04), "FileBasicInformation");
+        assert_eq!(file_info_class_name(0x01, 0x05), "FileStandardInformation");
+        assert_eq!(file_info_class_name(0x01, 0x0A), "FileRenameInformation");
+        assert_eq!(file_info_class_name(0x01, 0x0D), "FileDispositionInformation");
+        assert_eq!(file_info_class_name(0x01, 0x14), "FileEndOfFileInformation");
+        assert_eq!(file_info_class_name(0x01, 0x12), "FileAllInformation");
+        assert_eq!(file_info_class_name(0x01, 0xFF), "Unknown");
+    }
+
+    #[test]
+    fn test_file_info_class_name_filesystem() {
+        assert_eq!(file_info_class_name(0x02, 0x01), "FileFsVolumeInformation");
+        assert_eq!(file_info_class_name(0x02, 0x05), "FileFsAttributeInformation");
+        assert_eq!(file_info_class_name(0x02, 0x0B), "FileFsSectorSizeInformation");
+    }
+
+    #[test]
+    fn test_file_info_class_name_security() {
+        assert_eq!(file_info_class_name(0x03, 0x00), "SecurityInformation");
+    }
+
+    // ── Phase E: SMB1 detection tests ────────────────────────────────
+
+    #[test]
+    fn test_smb1_magic_detected() {
+        // Build an SMB1 message: \xFF SMB + 28 bytes of header
+        let mut smb1_data = Vec::new();
+        smb1_data.extend_from_slice(SMB1_MAGIC);
+        smb1_data.extend_from_slice(&[0u8; 28]); // minimal SMB1 header
+
+        let stream_data = frame_netbios(&smb1_data);
+        let stream = super::super::tcp_reassembly::TcpStream {
+            id: super::super::tcp_reassembly::StreamId {
+                src_ip: "10.0.0.1".parse().unwrap(),
+                src_port: 50000,
+                dst_ip: "10.0.0.2".parse().unwrap(),
+                dst_port: 445,
+            },
+            data: stream_data,
+            start_time_us: 1000,
+        };
+        let mut parser = SmbParser::new();
+        let msgs = parser.parse_stream(&stream).unwrap();
+        assert!(msgs.is_empty(), "SMB1 messages should be skipped");
+        assert_eq!(parser.stats.smb1_messages_skipped, 1);
+    }
+
+    #[test]
+    fn test_mixed_smb1_smb2_stream() {
+        // First PDU: SMB1, second PDU: SMB2 ECHO
+        let mut smb1_data = Vec::new();
+        smb1_data.extend_from_slice(SMB1_MAGIC);
+        smb1_data.extend_from_slice(&[0u8; 28]);
+
+        let smb2_data = build_smb2_message(0x000D, 0, 1, 0, 0, 0, &[]); // ECHO
+
+        let mut stream_data = Vec::new();
+        // Add SMB1 PDU with NetBIOS framing
+        let smb1_len = (smb1_data.len() as u32).to_be_bytes();
+        stream_data.extend_from_slice(&smb1_len);
+        stream_data.extend_from_slice(&smb1_data);
+        // Add SMB2 PDU with NetBIOS framing
+        let smb2_len = (smb2_data.len() as u32).to_be_bytes();
+        stream_data.extend_from_slice(&smb2_len);
+        stream_data.extend_from_slice(&smb2_data);
+
+        let stream = super::super::tcp_reassembly::TcpStream {
+            id: super::super::tcp_reassembly::StreamId {
+                src_ip: "10.0.0.1".parse().unwrap(),
+                src_port: 50000,
+                dst_ip: "10.0.0.2".parse().unwrap(),
+                dst_port: 445,
+            },
+            data: stream_data,
+            start_time_us: 1000,
+        };
+        let mut parser = SmbParser::new();
+        let msgs = parser.parse_stream(&stream).unwrap();
+        assert_eq!(msgs.len(), 1, "only SMB2 message should be returned");
+        assert!(matches!(msgs[0].command, SmbCommand::Echo));
+        assert_eq!(parser.stats.smb1_messages_skipped, 1);
+        assert_eq!(parser.stats.smb2_messages_parsed, 1);
+    }
+
+    #[test]
+    fn test_parser_stats_counting() {
+        let smb = build_smb2_message(0x000D, 0, 1, 0, 0, 0, &[]);
+        let stream_data = frame_netbios(&smb);
+        let stream = super::super::tcp_reassembly::TcpStream {
+            id: super::super::tcp_reassembly::StreamId {
+                src_ip: "10.0.0.1".parse().unwrap(),
+                src_port: 50000,
+                dst_ip: "10.0.0.2".parse().unwrap(),
+                dst_port: 445,
+            },
+            data: stream_data,
+            start_time_us: 1000,
+        };
+        let mut parser = SmbParser::new();
+        let msgs = parser.parse_stream(&stream).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(parser.stats.smb2_messages_parsed, 1);
+        assert_eq!(parser.stats.smb1_messages_skipped, 0);
+        assert_eq!(parser.stats.total_messages(), 1);
     }
 }

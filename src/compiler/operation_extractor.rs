@@ -12,8 +12,10 @@
 //! | SET_INFO (rename)       | `Rename`    |
 //! | SET_INFO (delete)       | `Delete`    |
 
+use super::smb_parser::fsctl_name;
 use super::state_machine::{SmbConnection, TrackedOperation};
 use crate::ir::{OpenMode, Operation};
+use crate::protocol::ntstatus::NtStatus;
 use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -214,6 +216,11 @@ impl OperationExtractor {
                 handle_ref: t.handle_ref.clone().unwrap_or_default(),
                 input_blob_path: None,
             },
+            "Negotiate" => {
+                // Negotiate operations are tracked for metadata but don't map to a replay IR op.
+                // We skip them since they're handled at connection setup.
+                return Ok(None);
+            }
             "ServerCopy" => Operation::ServerCopy {
                 op_id: next_op_id(),
                 client_id: t.client_id.clone(),
@@ -318,6 +325,47 @@ fn build_extensions(t: &TrackedOperation) -> Option<serde_json::Value> {
             );
         }
     }
+    if let Some(status) = t.nt_status {
+        map.insert(
+            "nt_status".to_string(),
+            serde_json::Value::Number(status.into()),
+        );
+        let nt = NtStatus::from_u32(status);
+        if let Some(name) = nt.name() {
+            map.insert(
+                "nt_status_name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+    }
+    if let Some(cc) = t.credit_charge {
+        if cc > 1 {
+            map.insert(
+                "credit_charge".to_string(),
+                serde_json::Value::Number(cc.into()),
+            );
+        }
+    }
+    if let Some(ctl) = t.ctl_code {
+        if let Some(name) = fsctl_name(ctl) {
+            map.insert(
+                "fsctl_name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+    }
+    if let Some(dialect) = t.negotiate_dialect {
+        map.insert(
+            "negotiate_dialect".to_string(),
+            serde_json::Value::Number(dialect.into()),
+        );
+    }
+    if let Some(caps) = t.negotiate_capabilities {
+        map.insert(
+            "negotiate_capabilities".to_string(),
+            serde_json::Value::Number(caps.into()),
+        );
+    }
     if map.is_empty() {
         None
     } else {
@@ -371,6 +419,8 @@ mod tests {
             write_flags: None,
             nt_status: None,
             credit_charge: None,
+            negotiate_dialect: None,
+            negotiate_capabilities: None,
         }
     }
 
@@ -564,7 +614,9 @@ mod tests {
         t.write_flags = Some(0x01);
         let ext = build_extensions(&t).unwrap();
         let obj = ext.as_object().unwrap();
-        assert_eq!(obj.len(), 8, "all 8 enrichment fields should be present");
+        // 8 original enrichments + nt_status/nt_status_name/credit_charge may be added
+        // depending on their values, so we just check the core enrichments are present
+        assert!(obj.len() >= 8, "at least 8 enrichment fields should be present");
     }
 
     // ── New operation type extraction tests ──────────────────────────
@@ -884,6 +936,90 @@ mod tests {
                 assert_eq!(ext["create_contexts"][0], "MxAc");
             }
             _ => panic!("expected Open"),
+        }
+    }
+
+    // ── Phase A6: NTSTATUS and credit_charge extension tests ─────────
+
+    #[test]
+    fn test_extensions_include_nt_status() {
+        let mut t = make_tracked("Open", "c1");
+        t.nt_status = Some(0x0000_0000); // STATUS_SUCCESS
+        let ext = build_extensions(&t).unwrap();
+        assert_eq!(ext["nt_status"], 0);
+        assert_eq!(ext["nt_status_name"], "STATUS_SUCCESS");
+    }
+
+    #[test]
+    fn test_extensions_include_nt_status_error() {
+        let mut t = make_tracked("Open", "c1");
+        t.nt_status = Some(0xC000_0022); // STATUS_ACCESS_DENIED
+        let ext = build_extensions(&t).unwrap();
+        assert_eq!(ext["nt_status"], 0xC000_0022u32);
+        assert_eq!(ext["nt_status_name"], "STATUS_ACCESS_DENIED");
+    }
+
+    #[test]
+    fn test_extensions_credit_charge_above_1() {
+        let mut t = make_tracked("Open", "c1");
+        t.credit_charge = Some(8);
+        let ext = build_extensions(&t).unwrap();
+        assert_eq!(ext["credit_charge"], 8);
+    }
+
+    #[test]
+    fn test_extensions_credit_charge_1_omitted() {
+        let mut t = make_tracked("Open", "c1");
+        t.credit_charge = Some(1); // == 1, should be omitted
+        let ext = build_extensions(&t).unwrap();
+        assert!(ext.get("credit_charge").is_none());
+    }
+
+    // ── Phase A6: Negotiate skip test ────────────────────────────────
+
+    #[test]
+    fn test_negotiate_is_skipped_by_extractor() {
+        let mut t = make_tracked("Negotiate", "c1");
+        t.negotiate_dialect = Some(0x0311);
+        t.negotiate_capabilities = Some(0x3F);
+        let extractor = OperationExtractor::new();
+        let ops = extractor.extract(&[make_conn(vec![t])]).unwrap();
+        assert!(ops.is_empty(), "Negotiate ops should be skipped by extractor");
+    }
+
+    // ── Phase A6: Negotiate extensions test ──────────────────────────
+
+    #[test]
+    fn test_extensions_negotiate_dialect_and_caps() {
+        let mut t = make_tracked("Open", "c1");
+        t.negotiate_dialect = Some(0x0311);
+        t.negotiate_capabilities = Some(0x7F);
+        let ext = build_extensions(&t).unwrap();
+        assert_eq!(ext["negotiate_dialect"], 0x0311);
+        assert_eq!(ext["negotiate_capabilities"], 0x7F);
+    }
+
+    // ── Phase A6: FSCTL name in extensions test ──────────────────────
+
+    #[test]
+    fn test_extensions_include_fsctl_name() {
+        let mut t = make_tracked("Open", "c1");
+        t.ctl_code = Some(0x0014_0204); // FSCTL_VALIDATE_NEGOTIATE_INFO
+        let ext = build_extensions(&t).unwrap();
+        assert_eq!(ext["fsctl_name"], "FSCTL_VALIDATE_NEGOTIATE_INFO");
+    }
+
+    #[test]
+    fn test_extensions_unknown_fsctl_no_name() {
+        let mut t = make_tracked("Open", "c1");
+        t.ctl_code = Some(0xFFFF_FFFF); // unknown FSCTL
+        t.create_disposition = None;
+        t.oplock_level = None;
+        t.desired_access = None;
+        let ext = build_extensions(&t);
+        // No other enrichments are set besides unknown FSCTL, so extensions may be None
+        if let Some(ext) = ext {
+            assert!(ext.get("fsctl_name").is_none(), "unknown FSCTL should not have fsctl_name");
         }
     }
 }

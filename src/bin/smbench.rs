@@ -102,6 +102,30 @@ enum Commands {
     Run {
         /// Path to workload IR JSON
         ir: PathBuf,
+
+        /// Domain for authentication (overrides SMBENCH_SMB_DOMAIN)
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Authentication method: auto, ntlm, kerberos (overrides SMBENCH_AUTH_METHOD)
+        #[arg(long, default_value = "auto")]
+        auth_method: String,
+
+        /// Path to Kerberos keytab file (overrides SMBENCH_KERBEROS_KEYTAB)
+        #[arg(long)]
+        kerberos_keytab: Option<String>,
+
+        /// Kerberos principal (overrides SMBENCH_KERBEROS_PRINCIPAL)
+        #[arg(long)]
+        kerberos_principal: Option<String>,
+
+        /// DFS path mapping (format: "\\\\domain\\DFSRoot=\\\\server\\share")
+        #[arg(long)]
+        dfs_map: Vec<String>,
+
+        /// Transport mode: tcp, rdma (overrides SMBENCH_TRANSPORT)
+        #[arg(long, default_value = "tcp")]
+        transport: String,
     },
 
     /// Validate a WorkloadIr JSON and print a summary
@@ -175,7 +199,34 @@ async fn main() -> Result<()> {
             println!("Compiled PCAP → {}", ir_path);
         }
 
-        Some(Commands::Run { ref ir }) => {
+        Some(Commands::Run {
+            ref ir,
+            ref domain,
+            ref auth_method,
+            ref kerberos_keytab,
+            ref kerberos_principal,
+            ref dfs_map,
+            ref transport,
+        }) => {
+            // CLI args override environment variables for SmbRsConfig::from_env().
+            if let Some(d) = domain {
+                std::env::set_var("SMBENCH_SMB_DOMAIN", d);
+            }
+            if auth_method != "auto" {
+                std::env::set_var("SMBENCH_AUTH_METHOD", auth_method);
+            }
+            if let Some(kt) = kerberos_keytab {
+                std::env::set_var("SMBENCH_KERBEROS_KEYTAB", kt);
+            }
+            if let Some(kp) = kerberos_principal {
+                std::env::set_var("SMBENCH_KERBEROS_PRINCIPAL", kp);
+            }
+            if transport != "tcp" {
+                std::env::set_var("SMBENCH_TRANSPORT", transport);
+            }
+            if !dfs_map.is_empty() {
+                std::env::set_var("SMBENCH_DFS_MAP", dfs_map.join(";"));
+            }
             run_workload(&cli, ir).await?;
         }
 

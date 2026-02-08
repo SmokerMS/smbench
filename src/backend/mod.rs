@@ -51,6 +51,12 @@ pub trait SMBConnectionInner: Send + Sync {
         extensions: &serde_json::Value,
     ) -> Result<Box<dyn SMBFileHandle>>;
     async fn execute_misc(&self, op: &Operation) -> Result<()>;
+
+    /// Reconnect the session after a session deletion (STATUS_USER_SESSION_DELETED = 0xC0000203).
+    /// Returns Ok(()) if reconnection succeeded, allowing the caller to retry the operation.
+    async fn reconnect(&self) -> Result<()> {
+        Err(anyhow!("reconnect not supported by this backend"))
+    }
 }
 
 #[async_trait]

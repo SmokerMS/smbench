@@ -141,6 +141,10 @@ pub struct TrackedOperation {
     pub nt_status: Option<u32>,
     /// Credit charge from the request header (for multi-credit tracking).
     pub credit_charge: Option<u16>,
+    /// Negotiated dialect (from NEGOTIATE response, e.g. 0x0311 = SMB 3.1.1).
+    pub negotiate_dialect: Option<u16>,
+    /// Negotiated capabilities (from NEGOTIATE response).
+    pub negotiate_capabilities: Option<u32>,
 }
 
 // ── state machine ──
@@ -160,6 +164,9 @@ pub struct SmbStateMachine {
     pending: HashMap<(u64, u64), PendingRequest>,
     /// Current client identifier (set per-stream).
     current_client: String,
+    /// Whether this connection upgraded from SMB1 to SMB2 (detected when
+    /// SMB1 NEGOTIATE is followed by SMB2 NEGOTIATE in the same stream).
+    pub connection_upgraded_from_smb1: bool,
 }
 
 impl SmbStateMachine {
@@ -168,12 +175,20 @@ impl SmbStateMachine {
             connections: HashMap::new(),
             pending: HashMap::new(),
             current_client: String::new(),
+            connection_upgraded_from_smb1: false,
         }
     }
 
     /// Set the current client identifier (call before feeding a stream's messages).
     pub fn set_client_id(&mut self, client_id: impl Into<String>) {
         self.current_client = client_id.into();
+    }
+
+    /// Notify the state machine that an SMB1 message was detected in the stream.
+    /// If a subsequent SMB2 NEGOTIATE is processed, it indicates a dialect upgrade.
+    pub fn notify_smb1_detected(&mut self) {
+        self.connection_upgraded_from_smb1 = true;
+        tracing::info!("SMB1 detected; marking connection for potential dialect upgrade");
     }
 
     /// Process a single SMB message.
@@ -212,6 +227,10 @@ impl SmbStateMachine {
         let key = (response.session_id, response.message_id);
         let request_opt = self.pending.remove(&key);
 
+        // Capture response status and request credit_charge for TrackedOperation enrichment.
+        let resp_status = response.status;
+        let req_credit_charge = request_opt.as_ref().map(|r| r.message.credit_charge);
+
         let conn = self.connections.get_mut(client_id).unwrap();
 
         // Ensure session exists.
@@ -225,6 +244,16 @@ impl SmbStateMachine {
         let success = response.status == 0 || response.status == 0x80000005;
 
         match (&response.command, request_opt) {
+            // ── NEGOTIATE ── store negotiated dialect
+            (SmbCommand::Negotiate(resp_params), Some(req)) => {
+                if success {
+                    let mut tracked = new_tracked(req.message.timestamp_us, "Negotiate", client_id);
+                    tracked.negotiate_dialect = Some(resp_params.dialect_revision);
+                    tracked.negotiate_capabilities = Some(resp_params.capabilities);
+                    push_tracked(conn, tracked, resp_status, req_credit_charge);
+                }
+            }
+
             // ── LOGOFF ── session cleanup
             (SmbCommand::Logoff, _) => {
                 if success {
@@ -310,7 +339,7 @@ impl SmbStateMachine {
                     if !create_context_tags.is_empty() {
                         tracked.create_context_tags = Some(create_context_tags);
                     }
-                    conn.operations.push(tracked);
+                    push_tracked(conn, tracked, resp_status, req_credit_charge);
                 }
             }
 
@@ -328,7 +357,7 @@ impl SmbStateMachine {
                 tracked.file_id = Some(req_fid);
                 tracked.handle_ref = Some(handle_ref);
                 tracked.path = path;
-                conn.operations.push(tracked);
+                push_tracked(conn, tracked, resp_status, req_credit_charge);
 
                 // Remove file from tree state.
                 if let Some(session) = conn.sessions.get_mut(&response.session_id) {
@@ -356,7 +385,7 @@ impl SmbStateMachine {
                 if r_flags != 0 {
                     tracked.read_flags = Some(r_flags);
                 }
-                conn.operations.push(tracked);
+                push_tracked(conn, tracked, resp_status, req_credit_charge);
             }
 
             // ── WRITE ──
@@ -380,46 +409,49 @@ impl SmbStateMachine {
                 if w_flags != 0 {
                     tracked.write_flags = Some(w_flags);
                 }
-                conn.operations.push(tracked);
+                push_tracked(conn, tracked, resp_status, req_credit_charge);
             }
 
             // ── SET_INFO (legacy rename/delete detection + new SetInfo tracking) ──
             (SmbCommand::SetInfo(_), Some(req)) => {
                 if success {
                     if let SmbCommand::SetInfo(params) = &req.message.command {
+                        let (handle_ref, path) = lookup_file(
+                            conn, response.session_id, req.message.tree_id, &params.file_id,
+                        );
                         if params.info_type == 0x01 && params.file_info_class == 0x0A {
                             // FileRenameInformation → Rename
-                            let (handle_ref, path) = lookup_file(
-                                conn, response.session_id, req.message.tree_id, &params.file_id,
-                            );
                             let mut tracked = new_tracked(req.message.timestamp_us, "Rename", client_id);
                             tracked.file_id = Some(params.file_id);
                             tracked.handle_ref = Some(handle_ref);
                             tracked.path = path;
                             tracked.rename_target = params.rename_target.clone();
-                            conn.operations.push(tracked);
+                            push_tracked(conn, tracked, resp_status, req_credit_charge);
                         } else if params.info_type == 0x01 && params.file_info_class == 0x0D {
                             // FileDispositionInformation → Delete
-                            let (handle_ref, path) = lookup_file(
-                                conn, response.session_id, req.message.tree_id, &params.file_id,
-                            );
                             let mut tracked = new_tracked(req.message.timestamp_us, "Delete", client_id);
                             tracked.file_id = Some(params.file_id);
                             tracked.handle_ref = Some(handle_ref);
                             tracked.path = path;
-                            conn.operations.push(tracked);
-                        } else {
-                            // All other SetInfo classes → generic SetInfo operation
-                            let (handle_ref, path) = lookup_file(
-                                conn, response.session_id, req.message.tree_id, &params.file_id,
-                            );
+                            push_tracked(conn, tracked, resp_status, req_credit_charge);
+                        } else if params.info_type == 0x01 && params.file_info_class == 0x14 {
+                            // FileEndOfFileInformation → SetInfo (Truncate)
                             let mut tracked = new_tracked(req.message.timestamp_us, "SetInfo", client_id);
                             tracked.file_id = Some(params.file_id);
                             tracked.handle_ref = Some(handle_ref);
                             tracked.path = path;
                             tracked.set_info_type = Some(params.info_type);
                             tracked.set_info_class = Some(params.file_info_class);
-                            conn.operations.push(tracked);
+                            push_tracked(conn, tracked, resp_status, req_credit_charge);
+                        } else {
+                            // All other SetInfo classes → generic SetInfo operation
+                            let mut tracked = new_tracked(req.message.timestamp_us, "SetInfo", client_id);
+                            tracked.file_id = Some(params.file_id);
+                            tracked.handle_ref = Some(handle_ref);
+                            tracked.path = path;
+                            tracked.set_info_type = Some(params.info_type);
+                            tracked.set_info_class = Some(params.file_info_class);
+                            push_tracked(conn, tracked, resp_status, req_credit_charge);
                         }
                     }
                 }
@@ -438,7 +470,7 @@ impl SmbStateMachine {
                         tracked.path = path;
                         tracked.pattern = Some(pattern.clone());
                         tracked.info_class = Some(*info_class);
-                        conn.operations.push(tracked);
+                        push_tracked(conn, tracked, resp_status, req_credit_charge);
                     }
                 }
             }
@@ -456,7 +488,7 @@ impl SmbStateMachine {
                         tracked.path = path;
                         tracked.info_type = Some(*info_type);
                         tracked.info_class = Some(*info_class);
-                        conn.operations.push(tracked);
+                        push_tracked(conn, tracked, resp_status, req_credit_charge);
                     }
                 }
             }
@@ -472,7 +504,7 @@ impl SmbStateMachine {
                         tracked.file_id = Some(*file_id);
                         tracked.handle_ref = Some(handle_ref);
                         tracked.path = path;
-                        conn.operations.push(tracked);
+                        push_tracked(conn, tracked, resp_status, req_credit_charge);
                     }
                 }
             }
@@ -495,7 +527,7 @@ impl SmbStateMachine {
                             tracked.lock_offset = Some(lock_elem.offset);
                             tracked.lock_length = Some(lock_elem.length);
                             tracked.lock_exclusive = Some(is_exclusive);
-                            conn.operations.push(tracked);
+                            push_tracked(conn, tracked, resp_status, req_credit_charge);
                         }
                     }
                 }
@@ -509,9 +541,7 @@ impl SmbStateMachine {
                             conn, response.session_id, req.message.tree_id, file_id,
                         );
                         // Detect special IOCTL subtypes
-                        const FSCTL_PIPE_TRANSACT: u32 = 0x0011C017;
-                        const FSCTL_SRV_COPYCHUNK: u32 = 0x001440F2;
-                        const FSCTL_SRV_COPYCHUNK_WRITE: u32 = 0x001480F2;
+                        use super::smb_parser::{FSCTL_PIPE_TRANSACT, FSCTL_SRV_COPYCHUNK, FSCTL_SRV_COPYCHUNK_WRITE};
                         match *ctl_code {
                             FSCTL_PIPE_TRANSACT => {
                                 let mut tracked = new_tracked(req.message.timestamp_us, "TransactPipe", client_id);
@@ -519,7 +549,7 @@ impl SmbStateMachine {
                                 tracked.handle_ref = Some(handle_ref);
                                 tracked.path = path;
                                 tracked.is_pipe = Some(true);
-                                conn.operations.push(tracked);
+                                push_tracked(conn, tracked, resp_status, req_credit_charge);
                             }
                             FSCTL_SRV_COPYCHUNK | FSCTL_SRV_COPYCHUNK_WRITE => {
                                 let mut tracked = new_tracked(req.message.timestamp_us, "ServerCopy", client_id);
@@ -530,7 +560,7 @@ impl SmbStateMachine {
                                 tracked.source_handle_ref = None;
                                 tracked.path = path;
                                 tracked.ctl_code = Some(*ctl_code);
-                                conn.operations.push(tracked);
+                                push_tracked(conn, tracked, resp_status, req_credit_charge);
                             }
                             _ => {
                                 let mut tracked = new_tracked(req.message.timestamp_us, "Ioctl", client_id);
@@ -538,7 +568,7 @@ impl SmbStateMachine {
                                 tracked.handle_ref = Some(handle_ref);
                                 tracked.path = path;
                                 tracked.ctl_code = Some(*ctl_code);
-                                conn.operations.push(tracked);
+                                push_tracked(conn, tracked, resp_status, req_credit_charge);
                             }
                         }
                     }
@@ -558,7 +588,7 @@ impl SmbStateMachine {
                     tracked.path = path;
                     tracked.notify_filter = Some(*filter);
                     tracked.notify_recursive = Some(*recursive);
-                    conn.operations.push(tracked);
+                    push_tracked(conn, tracked, resp_status, req_credit_charge);
                 }
             }
 
@@ -566,7 +596,7 @@ impl SmbStateMachine {
             (SmbCommand::Echo, Some(req)) => {
                 if success {
                     let tracked = new_tracked(req.message.timestamp_us, "Echo", client_id);
-                    conn.operations.push(tracked);
+                    push_tracked(conn, tracked, resp_status, req_credit_charge);
                 }
             }
 
@@ -576,7 +606,7 @@ impl SmbStateMachine {
                 // The message_id in the header was set to the cancelled request's message_id.
                 let mut tracked = new_tracked(response.timestamp_us, "Cancel", client_id);
                 tracked.cancel_message_id = Some(response.message_id);
-                conn.operations.push(tracked);
+                push_tracked(conn, tracked, resp_status, req_credit_charge);
             }
 
             // ── OPLOCK_BREAK ──
@@ -591,7 +621,7 @@ impl SmbStateMachine {
                         tracked.handle_ref = Some(handle_ref);
                         tracked.path = path;
                         tracked.oplock_level = Some(*req_level);
-                        conn.operations.push(tracked);
+                        push_tracked(conn, tracked, resp_status, req_credit_charge);
                     }
                 }
             }
@@ -655,7 +685,24 @@ fn new_tracked(
         write_flags: None,
         nt_status: None,
         credit_charge: None,
+        negotiate_dialect: None,
+        negotiate_capabilities: None,
     }
+}
+
+/// Enrich a tracked operation with response metadata (nt_status, credit_charge)
+/// and push it to the connection's operations list.
+fn push_tracked(
+    conn: &mut SmbConnection,
+    mut tracked: TrackedOperation,
+    nt_status: u32,
+    credit_charge: Option<u16>,
+) {
+    tracked.nt_status = Some(nt_status);
+    if let Some(cc) = credit_charge {
+        tracked.credit_charge = Some(cc);
+    }
+    conn.operations.push(tracked);
 }
 
 /// Look up handle_ref and path for a file_id in the connection's tree state.
@@ -936,10 +983,10 @@ mod tests {
 
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
             file_id: fid, info_type: 0x01, file_info_class: 0x0A,
-            rename_target: Some("new.txt".to_string()),
+            rename_target: Some("new.txt".to_string()), delete_on_close: None, end_of_file: None,
         }), false, 0)).unwrap();
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
-            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None,
+            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None, delete_on_close: None, end_of_file: None,
         }), true, 0)).unwrap();
 
         let conns = sm.finalize().unwrap();
@@ -955,10 +1002,10 @@ mod tests {
 
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
             file_id: fid, info_type: 0x01, file_info_class: 0x0D, // FileDispositionInformation
-            rename_target: None,
+            rename_target: None, delete_on_close: Some(true), end_of_file: None,
         }), false, 0)).unwrap();
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
-            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None,
+            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None, delete_on_close: None, end_of_file: None,
         }), true, 0)).unwrap();
 
         let conns = sm.finalize().unwrap();
@@ -973,10 +1020,10 @@ mod tests {
 
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
             file_id: fid, info_type: 0x01, file_info_class: 0x04, // FileBasicInformation
-            rename_target: None,
+            rename_target: None, delete_on_close: None, end_of_file: None,
         }), false, 0)).unwrap();
         sm.process_message(make_msg(3, 1, 100, SmbCommand::SetInfo(SetInfoParams {
-            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None,
+            file_id: [0; 16], info_type: 0, file_info_class: 0, rename_target: None, delete_on_close: None, end_of_file: None,
         }), true, 0)).unwrap();
 
         let conns = sm.finalize().unwrap();
@@ -1306,5 +1353,99 @@ mod tests {
             .filter(|o| o.operation_type == "Open")
             .collect();
         assert!(opens.is_empty(), "failed create should not produce Open operation");
+    }
+
+    // ── Phase E3: SMB1 detection and dialect upgrade tests ───────────
+
+    #[test]
+    fn test_notify_smb1_detected_sets_flag() {
+        let mut sm = SmbStateMachine::new();
+        assert!(!sm.connection_upgraded_from_smb1);
+
+        sm.notify_smb1_detected();
+        assert!(sm.connection_upgraded_from_smb1);
+    }
+
+    #[test]
+    fn test_smb1_detection_then_negotiate_is_upgrade() {
+        let mut sm = SmbStateMachine::new();
+        sm.set_client_id("10.0.0.1");
+        sm.notify_smb1_detected();
+        assert!(sm.connection_upgraded_from_smb1);
+
+        // Process a NEGOTIATE request/response after SMB1 detection
+        sm.process_message(make_msg(
+            0, 0, 0,
+            SmbCommand::Negotiate(crate::compiler::smb_parser::NegotiateParams {
+                dialect_count: 1,
+                dialects: vec![0x0311],
+                dialect_revision: 0,
+                security_mode: 1,
+                capabilities: 0x7F,
+                guid: [0; 16],
+                max_transact_size: 0,
+                max_read_size: 0,
+                max_write_size: 0,
+            }),
+            false, 0,
+        )).unwrap();
+
+        sm.process_message(make_msg(
+            0, 0, 0,
+            SmbCommand::Negotiate(crate::compiler::smb_parser::NegotiateParams {
+                dialect_count: 0,
+                dialects: vec![],
+                dialect_revision: 0x0311,
+                security_mode: 3,
+                capabilities: 0x3F,
+                guid: [0xBB; 16],
+                max_transact_size: 1048576,
+                max_read_size: 1048576,
+                max_write_size: 1048576,
+            }),
+            true, 0,
+        )).unwrap();
+
+        let conns = sm.finalize().unwrap();
+        let negotiates: Vec<_> = conns[0].operations.iter()
+            .filter(|o| o.operation_type == "Negotiate")
+            .collect();
+        assert_eq!(negotiates.len(), 1);
+        assert_eq!(negotiates[0].negotiate_dialect, Some(0x0311));
+        assert_eq!(negotiates[0].negotiate_capabilities, Some(0x3F));
+    }
+
+    // ── Phase A6: nt_status and credit_charge propagation tests ──────
+
+    #[test]
+    fn test_nt_status_propagated_on_echo() {
+        let mut sm = SmbStateMachine::new();
+        sm.set_client_id("10.0.0.1");
+
+        sm.process_message(make_msg(42, 1, 0, SmbCommand::Echo, false, 0)).unwrap();
+        sm.process_message(make_msg(42, 1, 0, SmbCommand::Echo, true, 0)).unwrap();
+
+        let conns = sm.finalize().unwrap();
+        let echoes: Vec<_> = conns[0].operations.iter()
+            .filter(|o| o.operation_type == "Echo")
+            .collect();
+        assert_eq!(echoes.len(), 1);
+        assert_eq!(echoes[0].nt_status, Some(0));
+    }
+
+    #[test]
+    fn test_credit_charge_propagated() {
+        let mut sm = SmbStateMachine::new();
+        sm.set_client_id("10.0.0.1");
+
+        sm.process_message(make_msg_ex(100, 1, 1, SmbCommand::Echo, false, 0, 5, false)).unwrap();
+        sm.process_message(make_msg_ex(100, 1, 1, SmbCommand::Echo, true, 0, 5, false)).unwrap();
+
+        let conns = sm.finalize().unwrap();
+        let echoes: Vec<_> = conns[0].operations.iter()
+            .filter(|o| o.operation_type == "Echo")
+            .collect();
+        assert_eq!(echoes.len(), 1);
+        assert_eq!(echoes[0].credit_charge, Some(5));
     }
 }
